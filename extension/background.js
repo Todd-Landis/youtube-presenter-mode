@@ -7,7 +7,8 @@ const ext = globalThis.browser ?? globalThis.chrome;
 const sessionStore = ext.storage.session ?? ext.storage.local;
 
 const DEFAULT_SETTINGS = { mode: 'extended', autoFullscreen: true, windowType: 'popup' };
-const YT_URL = /^https:\/\/(www\.)?youtube\.com\//;
+// Any youtube.com page, including consent and sign-in subdomains.
+const YT_URL = /^https:\/\/([a-z0-9-]+\.)*youtube\.com\//i;
 
 let S; // session; undefined = not loaded yet, null = none
 let lastState = null;
@@ -120,12 +121,53 @@ async function sendToTab(tabId, msg) {
 // working when tabs.sendMessage doesn't.
 const QUEUED_CMD_TTL_MS = 4000;
 let pendingCmds = [];
-let cmdSeq = 0;
+
+// Hand a command to the player: directly if possible, else via the queue.
+async function deliverCmd(s, cmd) {
+  await loadDiag();
+  // Keep order: once something is queued, later commands queue behind it.
+  if (pendingCmds.length) return queueCmd(cmd, { action: cmd.action, error: 'queued behind an earlier command' });
+  let { r, error } = await sendToTab(s.playerTabId, cmd);
+  if (r && !r.notReady) { D.commands.direct++; return r; }
+  // One quick retry; the player ignores a command ID it has already run.
+  await delay(150);
+  const firstError = r?.notReady ? 'player still loading' : error;
+  ({ r, error } = await sendToTab(s.playerTabId, cmd));
+  if (r && !r.notReady) { D.commands.retried++; return r; }
+  return queueCmd(cmd, {
+    action: cmd.action, error: firstError, retryError: r?.notReady ? 'player still loading' : error,
+    msSincePlayerState: hb.lastAt ? Date.now() - hb.lastAt : null,
+    playerVis: lastState?.vis ?? null, playerFocus: lastState?.focus ?? null,
+  });
+}
+
+function queueCmd(cmd, failure) {
+  pendingCmds.push({ ...cmd, queuedAt: Date.now() });
+  D.commands.queued++;
+  push(D.commands.failures, { at: Date.now(), ...failure }, 50);
+  saveDiagSoon();
+  return { ok: true, queued: true };
+}
+
+const saveIf = async (s) => { if (S === s) await saveSession(); };
 
 // ---- session lifecycle -----------------------------------------------------------
 
-async function startSession(msg, tab) {
-  if (await loadSession()) await endSession('replaced');
+// One start at a time. A double click or a retried message gets the same
+// answer instead of a second window.
+let startLock = null;
+
+function startSession(msg, tab) {
+  if (!startLock) startLock = doStart(msg, tab).finally(() => { startLock = null; });
+  return startLock;
+}
+
+async function doStart(msg, tab) {
+  const cur = await loadSession();
+  if (cur && cur.controllerTabId === tab.id && cur.videoId === msg.videoId && Date.now() - cur.startedAt < 8000) {
+    return { ok: true, session: cur };
+  }
+  if (cur) await endSession('replaced', { waitForStart: false });
   const settings = await getSettings();
   await loadDiag();
   const ctrl = msg.screen || {};
@@ -172,8 +214,16 @@ async function startSession(msg, tab) {
     ctrlScreen: ctrl,
     startedAt: Date.now(),
     onOther: false,
+    wasOnTv: false,
+    // Fullscreen: whether we want it, whether the player has filled its
+    // screen since its page loaded, and the auto-attempt budget for this page.
+    fsWanted: settings.mode === 'extended' && settings.autoFullscreen,
+    fsSeen: false,
     fsAutoAttempts: 0,
     fsLastAttemptAt: 0,
+    fsNormalRequestedAt: 0,
+    lastT: msg.t || 0,
+    lastTSavedAt: 0,
     boundsSaved: false,
   };
   lastState = null;
@@ -209,7 +259,8 @@ async function startSession(msg, tab) {
   return { ok: true, session: S };
 }
 
-async function endSession(reason) {
+async function endSession(reason, { waitForStart = true } = {}) {
+  if (waitForStart && startLock) await startLock.catch(() => {});
   const s = await loadSession();
   if (!s) return { ok: true, final: lastState };
   let final = lastState;
@@ -222,7 +273,7 @@ async function endSession(reason) {
   if (reason !== 'player-closed') {
     try { await ext.windows.remove(s.playerWindowId); } catch {}
   }
-  toTab(s.controllerTabId, { type: 'session-ended', reason, final });
+  toTab(s.controllerTabId, { type: 'session-ended', reason, final, sessionId: s.id });
   log('bg', 'session ended', { reason, durationSec: Math.round((Date.now() - s.startedAt) / 1000) });
   return { ok: true, final };
 }
@@ -262,22 +313,39 @@ function heartbeat(state) {
   hb.lastAt = now;
 }
 
-async function trackScreen(state, settings) {
-  const other = !sameScreen(state.screen, S.ctrlScreen);
+async function trackScreen(s, state) {
+  const other = !sameScreen(state.screen, s.ctrlScreen);
+  const fills = fillsScreen(state.screen) || !!state.fs;
   D.placement.playerScreen = state.screen;
   D.placement.playerOnOtherScreen = other;
-  if (other !== S.onOther) {
-    S.onOther = other;
-    if (other) S.fsAutoAttempts = 0;
-    await saveSession();
+  if (other !== s.onOther) {
+    s.onOther = other;
     log('player', other ? 'player window is on another screen' : 'player window is on the controller screen', state.screen);
+    if (other) {
+      s.wasOnTv = true;
+      s.fsAutoAttempts = 0;
+    } else if (s.wasOnTv) {
+      await tvLost(s);
+    }
+    await saveIf(s);
+  }
+
+  // It filled the screen and stopped without us asking: the user left
+  // fullscreen on purpose (Esc, ⌃⌘F). Don't fight them.
+  if (fills !== s.fsSeen) {
+    if (!fills && other && Date.now() - (s.fsNormalRequestedAt || 0) > 4000) {
+      s.fsWanted = false;
+      log('bg', 'user left fullscreen; not re-entering it automatically');
+    }
+    s.fsSeen = fills;
+    await saveIf(s);
   }
   if (!other) return;
 
-  if (!S.boundsSaved && !fillsScreen(state.screen)) {
-    S.boundsSaved = true;
+  if (!s.boundsSaved && !fills) {
+    s.boundsSaved = true;
     try {
-      const w = await ext.windows.get(S.playerWindowId);
+      const w = await ext.windows.get(s.playerWindowId);
       if (w.state !== 'fullscreen') {
         await ext.storage.local.set({ tvBounds: { left: w.left, top: w.top, width: w.width, height: w.height } });
         log('bg', 'remembered TV window position', pickWin(w));
@@ -286,14 +354,25 @@ async function trackScreen(state, settings) {
   }
   // Safari can ignore a fullscreen request made while the page is still
   // loading, so try a few times, bringing the window forward after the first.
-  const n = S.fsAutoAttempts || 0;
-  if (settings.autoFullscreen && n < AUTO_FS_ATTEMPTS && !fsInFlight && !fillsScreen(state.screen) && !state.fs &&
-      Date.now() - (S.fsLastAttemptAt || 0) > 4000) {
-    S.fsAutoAttempts = n + 1;
-    S.fsLastAttemptAt = Date.now();
-    await saveSession();
+  const n = s.fsAutoAttempts || 0;
+  if (s.fsWanted && !fills && n < AUTO_FS_ATTEMPTS && !fsInFlight && Date.now() - (s.fsLastAttemptAt || 0) > 4000) {
+    s.fsAutoAttempts = n + 1;
+    s.fsLastAttemptAt = Date.now();
+    await saveIf(s);
     tryWindowFullscreen('auto #' + (n + 1), false, { focus: n > 0, quiet: n + 1 < AUTO_FS_ATTEMPTS });
   }
+}
+
+// The player window came back to the controller's screen after being on the
+// TV: the display disconnected (Apple TV asleep, AirPlay dropped) or it was
+// dragged back. Pause rather than take over the Mac.
+async function tvLost(s) {
+  log('bg', 'player window left the TV; pausing');
+  s.fsWanted = false;
+  s.fsNormalRequestedAt = Date.now();
+  deliverCmd(s, { type: 'cmd', id: 'tv-lost-' + Date.now(), action: 'pause' });
+  ext.windows.update(s.playerWindowId, { state: 'normal' }).catch(() => {});
+  toTab(s.controllerTabId, { type: 'event', name: 'tv-lost' });
 }
 
 const AUTO_FS_ATTEMPTS = 3;
@@ -306,6 +385,7 @@ async function tryWindowFullscreen(trigger, toNormal = false, { focus = false, q
   if (!s) return { ok: false };
   await loadDiag();
   fsInFlight = true;
+  if (toNormal) s.fsNormalRequestedAt = Date.now();
   const r = { at: Date.now(), trigger, target: toNormal ? 'normal' : 'fullscreen', focus };
   try {
     if (focus) await ext.windows.update(s.playerWindowId, { focused: true });
@@ -334,15 +414,25 @@ async function tryWindowFullscreen(trigger, toNormal = false, { focus = false, q
 }
 
 async function onPlayerState(state, sender) {
-  await loadSession();
-  if (!S || sender.tab?.id !== S.playerTabId) return { ok: false, stale: true };
+  const s = await loadSession();
+  if (!s || sender.tab?.id !== s.playerTabId) return { ok: false, stale: true };
   await loadDiag();
   lastState = state;
   heartbeat(state);
   if (state.bridge) D.controls.bridge = state.bridge;
-  const settings = await getSettings();
-  if (S.mode === 'extended') await trackScreen(state, settings);
-  toTab(S.controllerTabId, { type: 'state', state, session: S });
+  // Follow the player (autoplay-next, a video picked on the TV) and keep a
+  // recent position, so a reloaded player page resumes the right video.
+  if (state.videoId && state.videoId !== s.videoId) {
+    s.videoId = state.videoId;
+    s.lastT = state.t;
+    await saveIf(s);
+  } else if (Date.now() - s.lastTSavedAt > 5000) {
+    s.lastT = state.t;
+    s.lastTSavedAt = Date.now();
+    await saveIf(s);
+  }
+  if (s.mode === 'extended') await trackScreen(s, state);
+  toTab(s.controllerTabId, { type: 'state', state, session: s });
   saveDiagSoon();
   // Hand over any commands that couldn't be delivered directly.
   const now = Date.now();
@@ -377,6 +467,15 @@ async function handle(msg, sender) {
       const s = await loadSession();
       const tabId = sender.tab?.id;
       const role = !s ? null : tabId === s.playerTabId ? 'player' : tabId === s.controllerTabId ? 'controller' : null;
+      if (role === 'player') {
+        // A (re)loaded player page: resume from the last known position of
+        // the video it should show, and allow fresh fullscreen attempts.
+        const t = lastState?.videoId === s.videoId ? lastState.t : s.lastT;
+        if (Number.isFinite(t) && t > s.startT) s.startT = t;
+        s.fsSeen = false;
+        s.fsAutoAttempts = 0;
+        await saveIf(s);
+      }
       return { role, session: role ? s : null, settings: await getSettings() };
     }
     case 'start':
@@ -393,27 +492,11 @@ async function handle(msg, sender) {
       if (msg.action === 'load' && msg.value?.videoId) {
         // A full page load in the player re-reads startT on hello.
         s.videoId = msg.value.videoId;
-        s.startT = msg.value.t || 0;
+        s.startT = s.lastT = msg.value.t || 0;
         await saveSession();
       }
-      await loadDiag();
-      const cmd = { type: 'cmd', id: Date.now().toString(36) + '-' + ++cmdSeq, action: msg.action, value: msg.value };
-      let { r, error } = await sendToTab(s.playerTabId, cmd);
-      if (r) { D.commands.direct++; return r; }
-      // One quick retry; the player ignores a command ID it has already run.
-      await delay(150);
-      const firstError = error;
-      ({ r, error } = await sendToTab(s.playerTabId, cmd));
-      if (r) { D.commands.retried++; return r; }
-      pendingCmds.push({ ...cmd, queuedAt: Date.now() });
-      D.commands.queued++;
-      push(D.commands.failures, {
-        at: Date.now(), action: msg.action, error: firstError, retryError: error,
-        msSincePlayerState: hb.lastAt ? Date.now() - hb.lastAt : null,
-        playerVis: lastState?.vis ?? null, playerFocus: lastState?.focus ?? null,
-      }, 50);
-      saveDiagSoon();
-      return { ok: true, queued: true };
+      const id = msg.id || 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      return deliverCmd(s, { type: 'cmd', id, seq: msg.seq, action: msg.action, value: msg.value });
     }
     case 'toggleWindowFullscreen': {
       const s = await loadSession();
@@ -424,7 +507,8 @@ async function handle(msg, sender) {
       if (typeof exit !== 'boolean') {
         try { exit = (await ext.windows.get(s.playerWindowId)).state === 'fullscreen'; } catch { exit = false; }
       }
-      // The user has taken over; stop automatic attempts.
+      // The user has taken over; their choice sticks.
+      s.fsWanted = !exit;
       s.fsAutoAttempts = AUTO_FS_ATTEMPTS;
       await saveSession();
       return tryWindowFullscreen('remote', exit);
@@ -496,7 +580,9 @@ ext.tabs.onRemoved.addListener(async (tabId) => {
 });
 
 ext.tabs.onUpdated.addListener(async (tabId, info) => {
-  if (!info.url || YT_URL.test(info.url)) return;
+  // Only a real page outside YouTube counts as leaving. New windows can report
+  // about:blank before their URL.
+  if (!info.url || !/^https?:/i.test(info.url) || YT_URL.test(info.url)) return;
   const s = await loadSession();
   if (!s) return;
   if (tabId === s.playerTabId) await endSession('player-closed');

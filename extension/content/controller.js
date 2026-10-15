@@ -9,10 +9,17 @@ YTPM.Controller = (() => {
   let active = false;
   let session = null;
   let st = null; // last player state
-  let lastCmdAt = 0;
   let stAt = 0; // when it arrived
+  let awaitCmd = null; // {id, at}: optimistic command the player hasn't confirmed yet
+  let pendingToggle = false; // play/pause pressed before the first state report
+  let cmdSeq = 0;
+  let starting = false;
+  let startedHere = false; // this tab started the session (vs. picked it up after a reload)
+  let enteredAt = 0;
+  let lastNavAt = 0;
+  let lastLoad = { id: null, at: 0 };
+  const endedSessions = new Set();
   let prevMuted = null;
-  let ctrlVideoId = null;
   let scrubbing = false;
   let volDragging = false;
   let ui = null;
@@ -26,7 +33,10 @@ YTPM.Controller = (() => {
     popup: 'Presenter mode ended.',
     'player-closed': 'The TV window was closed. Presenter mode ended.',
     replaced: 'Presenter mode moved to another tab.',
+    unreachable: "Couldn't reach the TV window. If it's still open, close it yourself.",
   };
+  // Holding these keys keeps acting; everything else fires once per press.
+  const REPEATABLE = new Set(['seekBy', 'volumeBy']);
 
   const NEEDS_CLICK = {
     gesture: 'TV window needs a click to start playback.',
@@ -67,16 +77,17 @@ YTPM.Controller = (() => {
   // Registered at document_start in the capture phase on window, so this runs
   // before any of YouTube's own key handlers.
   function onKeyDown(e) {
-    if (!active || isEditable(e)) return;
+    if (!active || e.isComposing || isEditable(e)) return;
     const m = mapKey(e);
     if (!m) return;
     e.preventDefault();
     e.stopImmediatePropagation();
+    if (e.repeat && !REPEATABLE.has(m[0])) return;
     command(m[0], m[1]);
   }
 
   function swallowKey(e) {
-    if (active && !isEditable(e) && mapKey(e)) {
+    if (active && !e.isComposing && !isEditable(e) && mapKey(e)) {
       e.preventDefault();
       e.stopImmediatePropagation();
     }
@@ -85,10 +96,16 @@ YTPM.Controller = (() => {
   // ---- local video ----------------------------------------------------------------
 
   const isMainVideo = (el) => el instanceof HTMLMediaElement && !!el.closest?.('#movie_player');
+  // The watch-page player and the Shorts player; both would play with sound.
+  const isYouTubePlayer = (el) => el instanceof HTMLMediaElement && !!el.closest?.('#movie_player, #shorts-player');
 
   function holdLocal(v) {
     if (!v.muted) v.muted = true;
     if (!v.paused) v.pause();
+  }
+
+  function holdAllLocal() {
+    document.querySelectorAll('#movie_player video, #shorts-player video').forEach(holdLocal);
   }
 
   function installGuards() {
@@ -96,15 +113,34 @@ YTPM.Controller = (() => {
     window.addEventListener('keyup', swallowKey, true);
     window.addEventListener('keypress', swallowKey, true);
     // Media events don't bubble, but capture-phase listeners on document still see them.
-    document.addEventListener('play', (e) => { if (active && isMainVideo(e.target)) holdLocal(e.target); }, true);
-    document.addEventListener('volumechange', (e) => {
-      if (active && isMainVideo(e.target) && !e.target.muted) e.target.muted = true;
+    // While presenting, nothing on this page plays with sound.
+    document.addEventListener('play', (e) => {
+      if (active && (isYouTubePlayer(e.target) || (e.target instanceof HTMLMediaElement && !e.target.muted))) holdLocal(e.target);
     }, true);
+    document.addEventListener('volumechange', (e) => {
+      if (active && isYouTubePlayer(e.target) && !e.target.muted) e.target.muted = true;
+    }, true);
+    document.addEventListener('seeked', onLocalSeek, true);
     document.addEventListener('yt-navigate-finish', onNavigate);
     setInterval(() => {
       ensureButton();
-      if (active) attachShield();
+      if (active) {
+        attachShield();
+        holdAllLocal();
+      }
     }, 1000);
+  }
+
+  // A timestamp or chapter link seeks YouTube's (paused) local player in
+  // place. Pass that on to the TV, but not the seeks YouTube makes by itself
+  // while a page loads.
+  function onLocalSeek(e) {
+    if (!active || !isMainVideo(e.target)) return;
+    if (Date.now() - Math.max(lastNavAt, enteredAt) < 1500) return;
+    const here = YTPM.parseWatch(location.href).videoId;
+    if (!here || here !== st?.videoId) return;
+    if (Math.abs(e.target.currentTime - currentTime()) < 1.5) return;
+    command('seekTo', e.target.currentTime);
   }
 
   function setEnabled(v) {
@@ -166,39 +202,53 @@ YTPM.Controller = (() => {
   // ---- session ---------------------------------------------------------------------
 
   function toggle() {
+    // A slow double-click on the presenter button shouldn't start and then end.
+    if (active && Date.now() - enteredAt < 1000) return;
     return active ? end() : start();
   }
 
   async function start() {
+    if (starting) return; // double-click
     const w = YTPM.parseWatch(location.href);
     if (!w.videoId) return toast('Open a YouTube video first.');
     const v = YTPM.findVideo();
-    toast('Opening the player window…');
-    const res = await YTPM.send({
-      type: 'start',
-      videoId: w.videoId, list: w.list, index: w.index,
-      t: v ? v.currentTime : 0,
-      screen: YTPM.screenInfo(),
-    });
-    if (!res?.ok) return toast('Could not open the player window: ' + (res?.error || 'no response from the extension'));
-    enter(res.session);
+    starting = true;
+    try {
+      toast('Opening the player window…');
+      // Safe to retry: the background returns the session it just started.
+      const res = await YTPM.sendRetry({
+        type: 'start',
+        videoId: w.videoId, list: w.list, index: w.index,
+        t: v ? v.currentTime : 0,
+        screen: YTPM.screenInfo(),
+      });
+      if (!res?.ok) return toast('Could not open the player window: ' + (res?.error || 'no response from the extension'));
+      if (endedSessions.has(res.session.id)) return; // ended while we waited
+      startedHere = true;
+      enter(res.session);
+    } finally {
+      starting = false;
+    }
   }
 
   async function end() {
-    const res = await YTPM.send({ type: 'end', reason: 'user' });
-    exit(res?.final ?? st, 'user');
+    const res = await YTPM.sendRetry({ type: 'end', reason: 'user' });
+    exit(res?.final ?? st, res ? 'user' : 'unreachable');
   }
 
   function enter(s) {
+    if (active && session?.id === s.id) return;
     session = s;
     if (!active) {
       const v = YTPM.findVideo();
       prevMuted = v ? v.muted : null;
-      ctrlVideoId = YTPM.parseWatch(location.href).videoId || s.videoId;
+      enteredAt = Date.now();
+      if (!starting) startedHere = false;
+      st = null;
+      awaitCmd = null;
     }
     active = true;
-    const v = YTPM.findVideo();
-    if (v) holdLocal(v);
+    holdAllLocal();
     buildUI();
     attachShield();
     ensureButton();
@@ -208,8 +258,10 @@ YTPM.Controller = (() => {
   }
 
   function exit(final, reason) {
+    if (session?.id) endedSessions.add(session.id);
     if (!active) return;
     active = false;
+    pendingToggle = false;
     clearInterval(tick);
     ui?.host.remove();
     ui = null;
@@ -230,17 +282,17 @@ YTPM.Controller = (() => {
 
   function onNavigate() {
     ensureButton();
+    lastNavAt = Date.now();
     if (!active) return;
-    const v = YTPM.findVideo();
-    if (v) holdLocal(v);
+    holdAllLocal();
+    // Picking another video here (watch page, Short or live link) plays it on
+    // the TV instead. yt-navigate-finish can fire twice for one navigation.
     const w = YTPM.parseWatch(location.href);
-    if (w.videoId && w.videoId !== ctrlVideoId) {
-      ctrlVideoId = w.videoId;
-      // Picking another video here plays it on the TV instead.
-      if (w.videoId !== st?.videoId) {
-        command('load', { videoId: w.videoId, list: w.list, index: w.index, t: 0 });
-        toast('Sent to the TV.');
-      }
+    const repeat = lastLoad.id === w.videoId && Date.now() - lastLoad.at < 2000;
+    if (w.videoId && w.videoId !== st?.videoId && !repeat) {
+      lastLoad = { id: w.videoId, at: Date.now() };
+      command('load', { videoId: w.videoId, list: w.list, index: w.index, t: w.t || 0 });
+      toast('Sent to the TV.');
     }
     attachShield();
   }
@@ -248,19 +300,40 @@ YTPM.Controller = (() => {
   function command(action, value) {
     // Send an explicit play or pause matching what the bar shows. A toggle can
     // undo itself when a state report crosses it in flight.
-    if (action === 'togglePlay' && st) action = st.paused || st.ended ? 'play' : 'pause';
-    lastCmdAt = Date.now();
-    // Optimistic updates so the bar feels immediate.
+    if (action === 'togglePlay') {
+      if (st) action = st.paused || st.ended ? 'play' : 'pause';
+      // No report yet. A TV that was just started is about to play, so the
+      // press means pause; otherwise decide when the first report arrives.
+      else if (startedHere && Date.now() - enteredAt < 8000) action = 'pause';
+      else {
+        pendingToggle = true;
+        return;
+      }
+    }
+    if (action === 'seekPercent' && st?.live) return;
+    // Time-based sequence numbers stay increasing across reloads of this tab.
+    const seq = Date.now() * 1000 + (++cmdSeq % 1000);
+    const id = 'c' + seq.toString(36);
+    // Optimistic updates so the bar feels immediate. Reports that don't yet
+    // include this command are held back until the player confirms it.
     if (st) {
       const now = Date.now();
       const t = currentTime();
-      if (action === 'play' || action === 'pause') { st = { ...st, t, paused: action === 'pause', ended: false }; stAt = now; }
-      if (action === 'seekBy') { st = { ...st, t: Math.max(0, t + value) }; stAt = now; }
-      if (action === 'seekTo') { st = { ...st, t: value }; stAt = now; }
+      let changed = true;
+      if (action === 'play' || action === 'pause') st = { ...st, t, paused: action === 'pause', ended: false };
+      else if (action === 'seekBy') st = { ...st, t: Math.max(0, t + value) };
+      else if (action === 'seekTo') st = { ...st, t: value };
+      else changed = false;
+      if (changed) {
+        stAt = now;
+        awaitCmd = { id, at: now };
+      }
     }
     render();
-    YTPM.send({ type: 'cmd', action, value }).then((r) => {
-      if (r && r.ok === false) toast('TV did not respond: ' + (r.error || action));
+    YTPM.sendRetry({ type: 'cmd', id, seq, action, value }).then((r) => {
+      if (!active) return;
+      if (!r) toast("Couldn't reach the extension. Try again.");
+      else if (r.ok === false) toast('TV did not respond: ' + (r.error || action));
     });
   }
 
@@ -411,7 +484,12 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
       ui.play.replaceChildren(icon(playing ? 'pause' : 'play'));
     }
     const t = currentTime();
-    if (!scrubbing) {
+    ui.scrub.disabled = !!st.live || !st.d;
+    if (st.live) {
+      ui.time.textContent = 'LIVE';
+      ui.scrub.value = '1000';
+      setFill(ui.scrub, 1);
+    } else if (!scrubbing) {
       ui.time.textContent = fmtTime(t) + ' / ' + fmtTime(st.d);
       const p = st.d ? t / st.d : 0;
       ui.scrub.value = String(Math.round(p * 1000));
@@ -431,7 +509,11 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
       ui.vol.value = String(muted ? 0 : st.vol);
       setFill(ui.vol, muted ? 0 : st.vol / 100);
     }
-    const warn = age >= 8000 ? 'The player window stopped reporting. It may be closed, frozen or throttled.' : NEEDS_CLICK[st.overlay];
+    const warn = age >= 8000
+      ? 'The player window stopped reporting. It may be closed, frozen or throttled.'
+      : st.error
+        ? `The TV can't play this video (${st.error}).`
+        : NEEDS_CLICK[st.overlay];
     ui.warn.classList.toggle('show', !!warn);
     ui.warnText.textContent = warn || '';
   }
@@ -461,15 +543,26 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
 
   function onMessage(msg) {
     switch (msg.type) {
-      case 'state':
+      case 'state': {
+        // A report still in flight when presenter mode ended must not revive it.
+        if (msg.session?.id && endedSessions.has(msg.session.id)) return { ok: true, ignored: true };
         if (!active && msg.session) enter(msg.session);
-        // A report taken before the last command would undo its optimistic update.
-        if (msg.state.sentAt < lastCmdAt) return { ok: true };
+        if (!active) return { ok: true };
+        // Keep the optimistic state until the player has run the command.
+        const ran = msg.state.ran || [];
+        if (awaitCmd && !ran.includes(awaitCmd.id) && Date.now() - awaitCmd.at < 2500) return { ok: true };
+        awaitCmd = null;
         st = msg.state;
         stAt = Date.now();
+        if (pendingToggle) {
+          pendingToggle = false;
+          command('togglePlay');
+        }
         render();
         return { ok: true };
+      }
       case 'session-ended':
+        if (msg.sessionId) endedSessions.add(msg.sessionId);
         exit(msg.final, msg.reason);
         return { ok: true };
       case 'start-request':
@@ -480,6 +573,7 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
         if (msg.name === 'airplay-connected') toast('AirPlay connected.');
         if (msg.name === 'play-blocked') toast('Safari blocked playback in the player window. Click it once.');
         if (msg.name === 'fullscreen-needs-click') toast('Safari needs one click on the TV to go fullscreen.');
+        if (msg.name === 'tv-lost') toast('TV display disconnected, so playback is paused.');
         return { ok: true };
     }
     return { ok: false, error: 'unhandled ' + msg.type };

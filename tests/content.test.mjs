@@ -199,6 +199,7 @@ function setup(url, hello, onSend) {
   const realPauseVideo = w.document.getElementById('movie_player').pauseVideo;
   w.document.getElementById('movie_player').pauseVideo = () => { vs.paused = true; setTimeout(() => { vs.paused = false; }, 100); };
   await cmd('pause');
+  await sleep(700);
   assert.equal(vs.paused, true, 'pause re-applied after YouTube resumed');
   assert.ok(sent.some((m) => m.type === 'event' && m.name === 'pause-retried'));
   w.document.getElementById('movie_player').pauseVideo = realPauseVideo;

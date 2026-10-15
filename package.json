@@ -7,6 +7,8 @@
   "type": "module",
   "scripts": {
     "test": "node tests/background.test.mjs && node tests/content.test.mjs",
+    "test:system": "node tests/system.test.mjs",
+    "test:all": "npm test && npm run test:system",
     "check": "for f in extension/*.js extension/content/*.js; do node --check \"$f\" || exit 1; done",
     "icons": "swift scripts/make-icons.swift extension/icons",
     "install:mac": "./scripts/install-mac-app.sh"

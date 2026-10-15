@@ -21,6 +21,12 @@ YTPM.Player = (() => {
   let airplayEverConnected = false;
   let overlayKind = null;
   let overlay = null;
+  let startedAt = 0;
+  // The last play/pause the user sent. A pause sent while this page was still
+  // loading must beat YouTube's autoplay and our own initial play.
+  let wantedPlay = null;
+  let ourPlayUntil = 0;
+  let pauseCheck = 0;
 
   const STYLE = `
 html.ytpm-player, html.ytpm-player body { overflow: hidden !important; background: #000 !important; }
@@ -100,8 +106,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
   function start(hello) {
     session = hello.session;
     active = true;
+    startedAt = Date.now();
     prepare();
-    if (bridge.ready) bridge.call('setRole', 'player').catch(() => {});
     bindVideo();
     timers.push(setInterval(bindVideo, 1000));
     timers.push(setInterval(() => report('tick'), 500));
@@ -109,9 +115,18 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     document.addEventListener('yt-navigate-finish', () => { bindVideo(); report('nav'); });
     document.addEventListener('fullscreenchange', () => { updateOverlay(); report('fullscreen'); });
     document.addEventListener('visibilitychange', () => report('visibility'));
-    window.addEventListener('resize', updateOverlay);
+    // Fullscreen changes resize the window; report at once so the background
+    // knows promptly whether the player fills its screen.
+    window.addEventListener('resize', () => { updateOverlay(); report('resize'); });
     event('player-ready', { bridge: bridge.info, screen: YTPM.screenInfo(), mode: session.mode });
     updateOverlay();
+  }
+
+  // The page-world bridge finished loading (or gave up) after start.
+  function onBridge() {
+    if (!active) return;
+    if (bridge.ready) bridge.call('setRole', 'player').catch(() => {});
+    event('bridge', bridge.info);
   }
 
   // Session ended without closing this window (the controller tab went away):
@@ -137,6 +152,10 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     for (const t of ['play', 'pause', 'ratechange', 'volumechange', 'seeked', 'ended']) {
       v.addEventListener(t, () => report(t));
     }
+    v.addEventListener('play', () => {
+      // YouTube autoplaying a page the user already paused from the remote.
+      if (wantedPlay === 'pause' && Date.now() > ourPlayUntil && Date.now() - startedAt < 10000) v.pause();
+    });
     for (const t of ['emptied', 'loadstart']) {
       v.addEventListener(t, () => { lastSrcChangeAt = Date.now(); });
     }
@@ -155,19 +174,25 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       remoteState: v.remote?.state ?? null,
     });
     if (!didInitialPlayback) {
-      if (v.readyState >= 1) initialPlayback();
-      else v.addEventListener('loadedmetadata', initialPlayback, { once: true });
+      // Through the command queue, so commands that arrive meanwhile run after it.
+      const queueInitial = () => { cmdChain = cmdChain.then(initialPlayback).catch(() => {}); };
+      if (v.readyState >= 1) queueInitial();
+      else v.addEventListener('loadedmetadata', queueInitial, { once: true });
     }
   }
 
   async function initialPlayback() {
     if (didInitialPlayback || !video) return;
     didInitialPlayback = true;
-    const t = session.startT || 0;
+    // Only resume a position meant for the video this page is showing (after
+    // an autoplay-next and a reload, the URL is a different video).
+    const sameVideo = YTPM.parseWatch(location.href).videoId === session.videoId;
+    const t = sameVideo ? session.startT || 0 : 0;
     if (t > 1 && Math.abs(video.currentTime - t) > 2) await seekTo(t);
     // In AirPlay mode, wait for the user's click so audio doesn't start on the Mac first.
     if (session.mode === 'airplay') return updateOverlay();
     await setMuted(false);
+    if (wantedPlay === 'pause') return A.pause();
     await A.play();
   }
 
@@ -253,6 +278,9 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       frames: q ? { dropped: q.droppedVideoFrames, total: q.totalVideoFrames } : null,
       overlay: overlayKind,
       bridge: bridge.info,
+      ran: ranCmds.slice(-20),
+      live: v ? v.duration === Infinity : false,
+      error: playerError(),
     };
     if (bridge.ready) {
       try {
@@ -262,15 +290,32 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
         if (b.cc != null) s.cc = b.cc;
         s.title = b.title || s.title;
         s.videoId = b.videoId || s.videoId;
+        if (b.live || (b.d > 86400 && !Number.isFinite(v?.duration))) s.live = true;
+        s.error = b.error || s.error;
         s.rates = b.rates;
         if (s.d == null) s.d = finite(b.d);
       } catch {}
     }
+    if (s.live) s.d = null;
     return s;
   }
 
+  // YouTube's error screen ("Video unavailable" and the like).
+  function playerError() {
+    const el = document.querySelector('#movie_player .ytp-error');
+    if (!el || getComputedStyle(el).display === 'none') return null;
+    return el.querySelector('.ytp-error-content-wrap-reason')?.textContent?.trim() || 'unavailable';
+  }
+
+  // A report requested while one is in flight runs right after it, so play,
+  // pause and command results reach the controller without waiting a tick.
+  let reportAgain = false;
   async function report(why) {
-    if (!active || reporting) return;
+    if (!active) return;
+    if (reporting) {
+      reportAgain = true;
+      return;
+    }
     reporting = true;
     try {
       const s = await snapshot();
@@ -283,13 +328,17 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       const res = await YTPM.send({ type: 'state', state: s });
       if (res?.stale) orphan();
       // Commands the background couldn't deliver directly ride on this reply.
-      for (const c of res?.cmds || []) runCmd(c);
+      for (const c of res?.cmds || []) runCmd(c).catch(() => {});
       if (YTPM.fillsScreen(s.screen) && needFullscreen) {
         needFullscreen = false;
         updateOverlay();
       }
     } finally {
       reporting = false;
+      if (reportAgain) {
+        reportAgain = false;
+        report('again');
+      }
     }
   }
 
@@ -399,7 +448,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     if (index) u.searchParams.set('index', index);
     if (t) u.searchParams.set('t', Math.floor(t) + 's');
     u.hash = YTPM.PLAYER_HASH;
-    location.replace(u.href);
+    YTPM.navigate(u.href);
     return 'navigate';
   }
 
@@ -417,6 +466,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     play: async () => {
       if (!video) return;
       try {
+        pauseCheck++;
+        ourPlayUntil = Date.now() + 2000;
         // Playing the element directly lets us see Safari's autoplay refusal.
         await video.play();
         needGesture = false;
@@ -437,17 +488,20 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       if (bridge.ready) await bridge.call('pause').catch(() => {});
       else if (youtubeThinksPlaying()) playButton()?.click();
       if (!video.paused) video.pause();
-      await sleep(500);
-      if (!video.paused) {
+      // Check it held a moment later, without holding up the next command;
+      // a play that arrives meanwhile cancels the check.
+      const token = ++pauseCheck;
+      setTimeout(() => {
+        if (token !== pauseCheck || wantedPlay === 'play' || !video || video.paused) return;
         video.pause();
         event('pause-retried', { bridge: bridge.ready, youtubeThinksPlaying: youtubeThinksPlaying() });
-      }
+      }, 500);
     },
     seekBy: (d) => seekTo((video?.currentTime || 0) + d),
     seekTo: (t) => seekTo(t),
     seekPercent: (n) => {
       const d = duration();
-      if (d) return seekTo((d * n) / 10);
+      if (d && Number.isFinite(d) && d < 86400) return seekTo((d * n) / 10);
     },
     volumeBy: async (d) => {
       const cur = await volume();
@@ -617,15 +671,37 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
   // ---- messages from the background ---------------------------------------------------
 
   // A command can arrive twice (direct retry, then the queued copy); run it once.
+  // Commands that set an absolute value can also arrive out of order; an
+  // older one is skipped so the latest play/pause, seek or setting wins.
   const ranCmds = [];
-  async function runCmd(msg) {
+  const GROUPS = { play: 'play', pause: 'play', seekTo: 'pos', seekPercent: 'pos', setRate: 'rate', setVolume: 'vol', load: 'load' };
+  const latestSeq = {};
+  // Commands run one at a time, in arrival order: a pause still checking that
+  // it held must not overlap the play that follows it.
+  let cmdChain = Promise.resolve();
+  function runCmd(msg) {
     if (msg.id) {
-      if (ranCmds.includes(msg.id)) return { ok: true, duplicate: true };
+      if (ranCmds.includes(msg.id)) return Promise.resolve({ ok: true, duplicate: true });
       ranCmds.push(msg.id);
       if (ranCmds.length > 100) ranCmds.shift();
     }
+    const run = cmdChain.then(() => runCmdNow(msg));
+    cmdChain = run.catch(() => {});
+    return run;
+  }
+
+  async function runCmdNow(msg) {
+    const group = GROUPS[msg.action];
+    if (group && msg.seq != null) {
+      if ((latestSeq[group] ?? -Infinity) > msg.seq) {
+        report('cmd');
+        return { ok: true, stale: true };
+      }
+      latestSeq[group] = msg.seq;
+    }
     const fn = A[msg.action];
     if (!fn) return { ok: false, error: 'unknown action ' + msg.action };
+    if (msg.action === 'play' || msg.action === 'pause') wantedPlay = msg.action;
     const result = await fn(msg.value);
     report('cmd');
     return { ok: true, result: result ?? null };
@@ -653,5 +729,5 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     return { ok: false, error: 'unhandled ' + msg.type };
   }
 
-  return { prepare, unprepare, start, onMessage };
+  return { prepare, unprepare, start, onBridge, onMessage };
 })();

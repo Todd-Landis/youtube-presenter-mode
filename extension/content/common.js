@@ -21,6 +21,20 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
     }
   };
 
+  // runtime.sendMessage occasionally fails in Safari. Only for messages that
+  // are safe to repeat (commands carry IDs; start and end are idempotent).
+  YTPM.sendRetry = async (msg, tries = 3) => {
+    for (let i = 0; i < tries; i++) {
+      const r = await YTPM.send(msg);
+      if (r != null) return r;
+      await YTPM.sleep(150 * (i + 1));
+    }
+    return null;
+  };
+
+  // Full page navigation (kept in one place so tests can observe it).
+  YTPM.navigate = (url) => location.replace(url);
+
   // DOM builder. YouTube enforces Trusted Types, so we never touch innerHTML.
   YTPM.h = (tag, props, ...kids) => {
     const svg = tag.startsWith('svg:');
@@ -66,16 +80,26 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
     return (h ? h + ':' : '') + mm + ':' + String(sec).padStart(2, '0');
   };
 
+  // Watch, Shorts and live URLs. `t` may be 90, 90s or 1h2m3s.
   YTPM.parseWatch = (href) => {
     try {
       const u = new URL(href);
-      if (u.pathname !== '/watch') return { videoId: null };
       const q = u.searchParams;
-      return { videoId: q.get('v'), list: q.get('list'), index: q.get('index') };
+      const path = u.pathname.match(/^\/(?:shorts|live)\/([\w-]{6,})/);
+      const videoId = u.pathname === '/watch' ? q.get('v') : path ? path[1] : null;
+      if (!videoId) return { videoId: null };
+      return { videoId, list: q.get('list'), index: q.get('index'), t: parseTime(q.get('t') || q.get('start')) };
     } catch {
       return { videoId: null };
     }
   };
+
+  function parseTime(v) {
+    if (!v) return 0;
+    if (/^\d+(\.\d+)?$/.test(v)) return Number(v);
+    const m = v.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+    return m ? (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0) : 0;
+  }
 
   YTPM.findVideo = () =>
     document.querySelector('#movie_player video.html5-main-video') ||
@@ -137,7 +161,7 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
   // Safari ignores `world: "MAIN"` in the manifest, so the bridge usually
   // arrives by one of the fallbacks. Each failure is kept for diagnostics.
   YTPM.initBridge = async () => {
-    const hello = () => YTPM.bridge.call('hello', null, 700).catch(() => null);
+    const hello = () => YTPM.bridge.call('hello', null, 400).catch(() => null);
     const errors = [];
     const attempts = [
       ['manifest', () => {}],

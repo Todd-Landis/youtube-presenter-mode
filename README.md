@@ -108,7 +108,11 @@ tab has focus:
 These keys are ignored while you type in the search box or a comment field.
 
 **Other behaviour:**
-- Clicking another video in the controller plays it on the TV.
+- Clicking another video, a Short or a live link in the controller plays it
+  on the TV. Timestamp and chapter links in the description or comments move
+  the TV too.
+- If the TV display disconnects (the Apple TV sleeps, AirPlay drops), playback
+  pauses instead of taking over the Mac screen.
 - **End** closes the player and leaves the Mac tab paused at the TV's
   position.
 - Closing the player window also ends presenter mode.
@@ -144,9 +148,11 @@ npm install
 npm test
 ```
 
-The tests run the background logic against mocked extension APIs and the
-content scripts in jsdom against a stubbed YouTube page. `npm run check`
-syntax-checks every script. `npm run icons` redraws the icons.
+`npm test` runs the quick unit tests. `npm run test:system` runs the
+end-to-end scenarios against simulated Safari and YouTube, including dropped
+messages, background restarts, reloads and fullscreen failures; see
+[TESTING.md](TESTING.md). `npm run check` syntax-checks every script.
+`npm run icons` redraws the icons.
 
 ```
 extension/
@@ -162,7 +168,7 @@ extension/
 scripts/
   install-mac-app.sh       builds, signs and installs the Mac app (permanent install)
   make-icons.swift         icon generator
-tests/
+tests/                     unit tests, system harness and scenarios (TESTING.md)
 ```
 
 YouTube enforces Trusted Types, so the content scripts build DOM nodes directly

@@ -39,6 +39,7 @@
         cc: typeof p.isSubtitlesOn === 'function' ? p.isSubtitlesOn() : null,
         title: vd.title || null, videoId: vd.video_id || null,
         list: p.getPlaylistId?.() || null,
+        live: !!vd.isLive, error: vd.errorCode || null,
       };
     },
     play: () => player().playVideo(),
