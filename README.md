@@ -169,3 +169,7 @@ and never assign `innerHTML`.
   The remote bar shows the new title.
 - AirPlay mode depends on Safari keeping YouTube's stream routed to the Apple
   TV. Treat it as experimental.
+
+## License
+
+[MIT](LICENSE)
