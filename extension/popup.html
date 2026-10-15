@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Presenter Mode</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --accent: #0071e3; --danger: #d70015; --card: #f5f5f7; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1c1c1e; --fg: #f5f5f7; --muted: #98989d; --line: #3a3a3c; --accent: #0a84ff; --danger: #ff453a; --card: #2c2c2e; } }
+  body { margin: 0; width: 300px; padding: 14px; background: var(--bg); color: var(--fg); font: 13px/1.4 -apple-system, BlinkMacSystemFont, sans-serif; }
+  h1 { font-size: 14px; margin: 0 0 10px; }
+  .status { padding: 8px 10px; border-radius: 8px; background: var(--card); margin-bottom: 12px; }
+  .status b { display: block; }
+  .status span { color: var(--muted); font-size: 12px; }
+  fieldset { border: 0; padding: 0; margin: 0 0 12px; }
+  legend { font-weight: 600; margin-bottom: 6px; }
+  label { display: flex; gap: 8px; align-items: flex-start; margin: 4px 0; cursor: pointer; }
+  label small { display: block; color: var(--muted); }
+  button { width: 100%; height: 32px; border: 0; border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer; background: var(--accent); color: #fff; margin-bottom: 6px; }
+  button.secondary { background: var(--card); color: var(--fg); }
+  button.danger { background: var(--danger); }
+  button[hidden] { display: none; }
+  .err { color: var(--danger); font-size: 12px; min-height: 1em; }
+  .foot { display: flex; gap: 6px; }
+</style>
+</head>
+<body>
+  <h1>YouTube Presenter Mode</h1>
+  <div class="status" id="status"><b>Idle</b><span>Open a YouTube video, then start.</span></div>
+  <fieldset>
+    <legend>Send video to the TV via</legend>
+    <label><input type="radio" name="mode" value="extended"> <div>Extended display<small>Fullscreen window on the AirPlay “Use as Separate Display” screen.</small></div></label>
+    <label><input type="radio" name="mode" value="airplay"> <div>AirPlay video (experimental)<small>Player window stays on the Mac; its video is AirPlayed. No extra desktop.</small></div></label>
+  </fieldset>
+  <label><input type="checkbox" id="autoFullscreen"> <div>Go fullscreen automatically on the TV</div></label>
+  <div style="height:8px"></div>
+  <button id="start">Start presenter mode</button>
+  <button id="end" class="danger" hidden>End presenter mode</button>
+  <div class="foot">
+    <button id="diag" class="secondary">Diagnostics</button>
+    <button id="forget" class="secondary" title="Forget where the TV window was placed">Forget TV spot</button>
+  </div>
+  <div class="err" id="err"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

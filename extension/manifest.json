@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Presenter Mode",
+  "short_name": "Presenter Mode",
+  "version": "0.1.0",
+  "description": "Play a YouTube video on your TV (AirPlay display or AirPlay video) while the Mac tab becomes a remote control.",
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png",
+    "256": "icons/icon-256.png",
+    "512": "icons/icon-512.png"
+  },
+  "action": {
+    "default_title": "YouTube Presenter Mode",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/toolbar-16.png",
+      "32": "icons/toolbar-32.png"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "permissions": ["tabs", "storage"],
+  "host_permissions": ["*://www.youtube.com/*", "*://youtube.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://www.youtube.com/*"],
+      "js": ["content/common.js", "content/player.js", "content/controller.js", "content/boot.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://www.youtube.com/*"],
+      "js": ["content/page-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/page-bridge.js"],
+      "matches": ["*://www.youtube.com/*"]
+    }
+  ],
+  "commands": {
+    "toggle-presenter": {
+      "suggested_key": { "default": "Alt+Shift+P" },
+      "description": "Start or end presenter mode"
+    }
+  }
+}
