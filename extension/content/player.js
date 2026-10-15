@@ -282,6 +282,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       lastSentAt = Date.now();
       const res = await YTPM.send({ type: 'state', state: s });
       if (res?.stale) orphan();
+      // Commands the background couldn't deliver directly ride on this reply.
+      for (const c of res?.cmds || []) runCmd(c);
       if (YTPM.fillsScreen(s.screen) && needFullscreen) {
         needFullscreen = false;
         updateOverlay();
@@ -614,15 +616,25 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
 
   // ---- messages from the background ---------------------------------------------------
 
+  // A command can arrive twice (direct retry, then the queued copy); run it once.
+  const ranCmds = [];
+  async function runCmd(msg) {
+    if (msg.id) {
+      if (ranCmds.includes(msg.id)) return { ok: true, duplicate: true };
+      ranCmds.push(msg.id);
+      if (ranCmds.length > 100) ranCmds.shift();
+    }
+    const fn = A[msg.action];
+    if (!fn) return { ok: false, error: 'unknown action ' + msg.action };
+    const result = await fn(msg.value);
+    report('cmd');
+    return { ok: true, result: result ?? null };
+  }
+
   async function onMessage(msg) {
     switch (msg.type) {
-      case 'cmd': {
-        const fn = A[msg.action];
-        if (!fn) return { ok: false, error: 'unknown action ' + msg.action };
-        const result = await fn(msg.value);
-        report('cmd');
-        return { ok: true, result: result ?? null };
-      }
+      case 'cmd':
+        return runCmd(msg);
       case 'getState':
         return snapshot();
       case 'selftest':

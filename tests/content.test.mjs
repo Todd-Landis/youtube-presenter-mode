@@ -155,7 +155,9 @@ function setup(url, hello, onSend) {
 // ---------------- player ----------------
 {
   const session = { id: 's', mode: 'extended', videoId: 'abc', startT: 30, ctrlScreen: { sw: 1800, sh: 1169, al: null, at: null } };
-  const t = setup('https://www.youtube.com/watch?v=abc&t=30s#ytpm-player', { role: 'player', session, settings: {} });
+  let queued = [];
+  const t = setup('https://www.youtube.com/watch?v=abc&t=30s#ytpm-player', { role: 'player', session, settings: {} },
+    (m) => (m.type === 'state' ? { ok: true, cmds: queued.splice(0) } : null));
   const { w, vs, api, sent, deliver } = t;
   const doc = w.document;
   await sleep(1600);
@@ -203,6 +205,14 @@ function setup(url, hello, onSend) {
   await cmd('togglePlay');
   assert.equal(vs.paused, false);
   assert.equal(await cmd('load', { videoId: 'zzz', t: 0 }), 'api');
+
+  // Same command id twice (direct retry + queued copy) runs once.
+  const before = api.calls.filter((c) => c[0] === 'seekTo').length;
+  assert.equal((await deliver({ type: 'cmd', id: 'x1', action: 'seekBy', value: 3 })).ok, true);
+  assert.equal((await deliver({ type: 'cmd', id: 'x1', action: 'seekBy', value: 3 })).duplicate, true);
+  queued.push({ type: 'cmd', id: 'x1', action: 'seekBy', value: 3 }, { type: 'cmd', id: 'x2', action: 'seekBy', value: 3 });
+  await sleep(700); // next state report collects the queue
+  assert.equal(api.calls.filter((c) => c[0] === 'seekTo').length, before + 2, 'x1 once, then queued x2');
 
   // Fullscreen toggle tells the background which way to go.
   await cmd('toggleFullscreen');

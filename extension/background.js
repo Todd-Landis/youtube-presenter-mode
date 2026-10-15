@@ -43,7 +43,7 @@ async function getSettings() {
   return { ...DEFAULT_SETTINGS, ...(r.settings || {}) };
 }
 
-const DIAG_VERSION = 2;
+const DIAG_VERSION = 3;
 
 const newDiag = () => ({
   version: DIAG_VERSION,
@@ -52,6 +52,7 @@ const newDiag = () => ({
   placement: {},
   playback: { msgs: 0, playingSec: 0, maxGapMs: 0, maxTickGapMs: 0, droppedFrames: 0, gaps: [], stalls: [], visibility: [] },
   controls: {},
+  commands: { direct: 0, retried: 0, queued: 0, expired: 0, failures: [] },
   airplay: { connects: 0, drops: 0, events: [] },
   log: [],
 });
@@ -104,6 +105,23 @@ function toTab(tabId, msg) {
   return ext.tabs.sendMessage(tabId, msg).catch(() => null);
 }
 
+// Like toTab, but keeps Safari's reason when a message doesn't get through.
+async function sendToTab(tabId, msg) {
+  try {
+    const r = await ext.tabs.sendMessage(tabId, msg);
+    return r == null ? { r: null, error: 'empty response' } : { r, error: null };
+  } catch (e) {
+    return { r: null, error: String(e?.message || e) };
+  }
+}
+
+// Commands that couldn't be delivered directly. The player collects them in
+// the reply to its next state report (every 500 ms), a channel that keeps
+// working when tabs.sendMessage doesn't.
+const QUEUED_CMD_TTL_MS = 4000;
+let pendingCmds = [];
+let cmdSeq = 0;
+
 // ---- session lifecycle -----------------------------------------------------------
 
 async function startSession(msg, tab) {
@@ -154,10 +172,12 @@ async function startSession(msg, tab) {
     ctrlScreen: ctrl,
     startedAt: Date.now(),
     onOther: false,
-    fsAttempted: false,
+    fsAutoAttempts: 0,
+    fsLastAttemptAt: 0,
     boundsSaved: false,
   };
   lastState = null;
+  pendingCmds = [];
   hb.lastAt = 0;
   hb.prev = null;
   await saveSession();
@@ -172,9 +192,18 @@ async function startSession(msg, tab) {
     rememberedBoundsUsed: !!tvBounds && settings.mode !== 'airplay',
   };
   log('bg', 'session started', { mode: settings.mode, videoId: msg.videoId, t: msg.t });
-  // Where did Safari actually put it?
+  // Where did Safari actually put it? If it ignored the position, move it.
   delay(1500).then(async () => {
-    try { D.placement.after1500ms = pickWin(await ext.windows.get(win.id)); } catch {}
+    try {
+      const w = await ext.windows.get(win.id);
+      D.placement.after1500ms = pickWin(w);
+      const off = Math.abs(w.left - bounds.left) > 40 || Math.abs(w.top - bounds.top) > 40;
+      if (off && w.state !== 'fullscreen') {
+        await ext.windows.update(win.id, bounds);
+        D.placement.moved = pickWin(await ext.windows.get(win.id));
+        log('bg', 'moved player window to the requested spot', D.placement.moved);
+      }
+    } catch {}
     saveDiagSoon();
   });
   return { ok: true, session: S };
@@ -239,7 +268,7 @@ async function trackScreen(state, settings) {
   D.placement.playerOnOtherScreen = other;
   if (other !== S.onOther) {
     S.onOther = other;
-    if (other) S.fsAttempted = false;
+    if (other) S.fsAutoAttempts = 0;
     await saveSession();
     log('player', other ? 'player window is on another screen' : 'player window is on the controller screen', state.screen);
   }
@@ -255,27 +284,40 @@ async function trackScreen(state, settings) {
       }
     } catch {}
   }
-  if (settings.autoFullscreen && !S.fsAttempted && !fillsScreen(state.screen) && !state.fs) {
-    S.fsAttempted = true;
+  // Safari can ignore a fullscreen request made while the page is still
+  // loading, so try a few times, bringing the window forward after the first.
+  const n = S.fsAutoAttempts || 0;
+  if (settings.autoFullscreen && n < AUTO_FS_ATTEMPTS && !fsInFlight && !fillsScreen(state.screen) && !state.fs &&
+      Date.now() - (S.fsLastAttemptAt || 0) > 4000) {
+    S.fsAutoAttempts = n + 1;
+    S.fsLastAttemptAt = Date.now();
     await saveSession();
-    tryWindowFullscreen('auto');
+    tryWindowFullscreen('auto #' + (n + 1), false, { focus: n > 0, quiet: n + 1 < AUTO_FS_ATTEMPTS });
   }
 }
 
+const AUTO_FS_ATTEMPTS = 3;
+let fsInFlight = false;
+
 // Native window fullscreen needs no user gesture and survives page loads,
 // unlike element fullscreen. If Safari ignores it, the player asks for a click.
-async function tryWindowFullscreen(trigger, toNormal = false) {
+async function tryWindowFullscreen(trigger, toNormal = false, { focus = false, quiet = false } = {}) {
   const s = await loadSession();
   if (!s) return { ok: false };
   await loadDiag();
-  const r = { at: Date.now(), trigger, target: toNormal ? 'normal' : 'fullscreen' };
+  fsInFlight = true;
+  const r = { at: Date.now(), trigger, target: toNormal ? 'normal' : 'fullscreen', focus };
   try {
+    if (focus) await ext.windows.update(s.playerWindowId, { focused: true });
     await ext.windows.update(s.playerWindowId, { state: toNormal ? 'normal' : 'fullscreen' });
     r.call = 'ok';
   } catch (e) {
     r.call = 'threw: ' + (e?.message || e);
   }
   await delay(2500);
+  fsInFlight = false;
+  // Hand keyboard focus back to the controller so shortcuts keep working.
+  if (focus) ext.windows.update(s.controllerWindowId, { focused: true }).catch(() => {});
   try { r.windowStateAfter = (await ext.windows.get(s.playerWindowId)).state; } catch {}
   // Ask the player directly; the last relayed state can be stale.
   const fresh = await toTab(s.playerTabId, { type: 'getState' });
@@ -284,7 +326,7 @@ async function tryWindowFullscreen(trigger, toNormal = false) {
   r.ok = toNormal ? !fills : fills;
   D.placement.windowFullscreen = r;
   log('bg', 'window ' + r.target + (r.ok ? ' worked' : ' did not take'), r);
-  if (!toNormal && !fills) {
+  if (!toNormal && !fills && !quiet) {
     toTab(s.playerTabId, { type: 'needFullscreenClick' });
     toTab(s.controllerTabId, { type: 'event', name: 'fullscreen-needs-click' });
   }
@@ -302,7 +344,12 @@ async function onPlayerState(state, sender) {
   if (S.mode === 'extended') await trackScreen(state, settings);
   toTab(S.controllerTabId, { type: 'state', state, session: S });
   saveDiagSoon();
-  return { ok: true };
+  // Hand over any commands that couldn't be delivered directly.
+  const now = Date.now();
+  const fresh = pendingCmds.filter((c) => now - c.queuedAt < QUEUED_CMD_TTL_MS);
+  D.commands.expired += pendingCmds.length - fresh.length;
+  pendingCmds = [];
+  return { ok: true, cmds: fresh };
 }
 
 async function onPlayerEvent(msg, sender) {
@@ -349,8 +396,24 @@ async function handle(msg, sender) {
         s.startT = msg.value.t || 0;
         await saveSession();
       }
-      const r = await toTab(s.playerTabId, { type: 'cmd', action: msg.action, value: msg.value });
-      return r ?? { ok: false, error: 'player window did not answer' };
+      await loadDiag();
+      const cmd = { type: 'cmd', id: Date.now().toString(36) + '-' + ++cmdSeq, action: msg.action, value: msg.value };
+      let { r, error } = await sendToTab(s.playerTabId, cmd);
+      if (r) { D.commands.direct++; return r; }
+      // One quick retry; the player ignores a command ID it has already run.
+      await delay(150);
+      const firstError = error;
+      ({ r, error } = await sendToTab(s.playerTabId, cmd));
+      if (r) { D.commands.retried++; return r; }
+      pendingCmds.push({ ...cmd, queuedAt: Date.now() });
+      D.commands.queued++;
+      push(D.commands.failures, {
+        at: Date.now(), action: msg.action, error: firstError, retryError: error,
+        msSincePlayerState: hb.lastAt ? Date.now() - hb.lastAt : null,
+        playerVis: lastState?.vis ?? null, playerFocus: lastState?.focus ?? null,
+      }, 50);
+      saveDiagSoon();
+      return { ok: true, queued: true };
     }
     case 'toggleWindowFullscreen': {
       const s = await loadSession();
@@ -361,6 +424,9 @@ async function handle(msg, sender) {
       if (typeof exit !== 'boolean') {
         try { exit = (await ext.windows.get(s.playerWindowId)).state === 'fullscreen'; } catch { exit = false; }
       }
+      // The user has taken over; stop automatic attempts.
+      s.fsAutoAttempts = AUTO_FS_ATTEMPTS;
+      await saveSession();
       return tryWindowFullscreen('remote', exit);
     }
     case 'injectBridge': {

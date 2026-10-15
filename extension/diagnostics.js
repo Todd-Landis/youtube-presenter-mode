@@ -88,6 +88,25 @@ function render(r) {
     grid([['When', (g) => time(g.at)], ['Visibility', (g) => g.vis], ['Focused', (g) => g.focus]], s2.visibility.slice().reverse()),
   );
 
+  // Command delivery
+  const c = D.commands || { direct: 0, retried: 0, queued: 0, expired: 0, failures: [] };
+  const total = c.direct + c.retried + c.queued;
+  if (!total) verdict('vc', 'none', 'no commands yet');
+  else if (c.expired) verdict('vc', 'bad', `${c.expired} commands lost`);
+  else if (c.queued || c.retried) verdict('vc', 'warn', `${c.retried + c.queued} of ${total} needed a fallback`);
+  else verdict('vc', 'ok', `all ${total} delivered directly`);
+  $('sc').replaceChildren(
+    kv([
+      ['Delivered directly', c.direct],
+      ['Delivered on retry', c.retried],
+      ['Queued for the player to collect', c.queued],
+      ['Expired in the queue', c.expired],
+    ]),
+    el('h3', { style: 'font-size:13px;margin:12px 0 4px' }, 'Direct delivery failures'),
+    grid([['When', (x) => time(x.at)], ['Command', (x) => x.action], ['Safari error', (x) => x.error], ['Retry error', (x) => x.retryError],
+      ['ms since player report', (x) => x.msSincePlayerState], ['Player visibility', (x) => x.playerVis]], c.failures.slice().reverse()),
+  );
+
   // Control paths
   const s3 = D.controls || {};
   const results = s3.selftest?.results || [];

@@ -16,6 +16,7 @@ const sent = [];
 const tabHandlers = {};
 let onMessage, onRemoved, onCommand;
 let winSeq = 10, tabSeq = 100;
+let misplaceNextWindow = false; // simulate Safari ignoring left/top
 const browser = {
   storage: { session: area('session'), local: area('local') },
   runtime: { onMessage: { addListener: (f) => { onMessage = f; } } },
@@ -23,7 +24,8 @@ const browser = {
     create: async (o) => {
       if (o.type === 'popup') throw new Error('popup unsupported (simulated)');
       const id = ++winSeq, tid = ++tabSeq;
-      const w = { id, left: o.left, top: o.top, width: o.width, height: o.height, state: 'normal', tabs: [{ id: tid, windowId: id }] };
+      const w = { id, left: misplaceNextWindow ? 0 : o.left, top: o.top, width: o.width, height: o.height, state: 'normal', tabs: [{ id: tid, windowId: id }] };
+      misplaceNextWindow = false;
       windows.set(id, w); tabs.set(tid, { id: tid, windowId: id });
       return w;
     },
@@ -43,6 +45,8 @@ const browser = {
 const ctx = vm.createContext({ browser, console, setTimeout, clearTimeout, URL, navigator: { userAgent: 'node-test' }, structuredClone });
 vm.runInContext(src, ctx);
 
+const inBg = (code) => vm.runInContext(code, ctx);
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 const call = (msg, tabId) => new Promise((res) => onMessage(msg, { tab: tabId ? tabs.get(tabId) : undefined }, res));
 const ctrlScreen = { sw: 1800, sh: 1169, al: 0, at: 39, aw: 1800, ah: 1040, iw: 1800, ih: 1000 };
 const tvScreen = { sw: 1920, sh: 1080, al: 1800, at: 0, aw: 1920, ah: 1080, iw: 1280, ih: 690 };
@@ -66,10 +70,23 @@ const st = (t, extra = {}) => ({ seq: 1, sentAt: Date.now(), t, d: 600, paused: 
 assert.equal((await call({ type: 'state', state: st(43) }, s.playerTabId)).ok, true);
 assert.ok(mem.local.tvBounds, 'TV bounds remembered');
 assert.ok(sent.some((m) => m.id === 2 && m.msg.type === 'state'), 'state relayed to controller');
-await new Promise((res) => setTimeout(res, 2700));
+await sleep(2700);
 assert.equal(windows.get(s.playerWindowId).state, 'fullscreen');
-assert.ok(sent.some((m) => m.msg.type === 'needFullscreenClick'), 'player asked for a click since it still did not fill the screen');
+// The player never reports filling the screen here, so auto-fullscreen retries,
+// and only the last failed attempt asks for a click.
+assert.ok(!sent.some((m) => m.msg.type === 'needFullscreenClick'), 'first attempt is quiet');
+for (let i = 2; i <= 3; i++) {
+  inBg('S.fsLastAttemptAt = 0');
+  await call({ type: 'state', state: st(43 + i) }, s.playerTabId);
+  await sleep(2700);
+}
+assert.equal(inBg('S.fsAutoAttempts'), 3);
+assert.equal(inBg('D.placement.windowFullscreen.focus'), true, 'later attempts bring the window forward');
+assert.ok(sent.some((m) => m.msg.type === 'needFullscreenClick'), 'player asked for a click after the last attempt');
 assert.ok(sent.some((m) => m.id === 2 && m.msg.type === 'event' && m.msg.name === 'fullscreen-needs-click'), 'controller told too');
+inBg('S.fsLastAttemptAt = 0');
+await call({ type: 'state', state: st(47) }, s.playerTabId);
+assert.equal(inBg('S.fsAutoAttempts'), 3, 'no attempts beyond the limit');
 
 // Remote fullscreen button: the player says which way to go.
 const filled = { ...tvScreen, iw: 1920, ih: 1080 };
@@ -94,6 +111,26 @@ assert.equal((await call({ type: 'state', state: st(1) }, 2)).stale, true);
 // command relay
 const c = await call({ type: 'cmd', action: 'seekBy', value: 10 }, 2);
 assert.equal(c.echo.action, 'seekBy');
+assert.ok(c.echo.id, 'commands carry an id');
+
+// Direct delivery fails → queued, handed over with the next state report.
+const realHandler = tabHandlers[s.playerTabId];
+tabHandlers[s.playerTabId] = (msg) => { if (msg.type === 'cmd') throw new Error('Could not establish connection'); return realHandler(msg); };
+const q = await call({ type: 'cmd', action: 'pause' }, 2);
+assert.deepEqual({ ok: q.ok, queued: q.queued }, { ok: true, queued: true });
+const stRes = await call({ type: 'state', state: st(50) }, s.playerTabId);
+assert.equal(stRes.cmds.length, 1);
+assert.equal(stRes.cmds[0].action, 'pause');
+assert.equal((await call({ type: 'state', state: st(50.5) }, s.playerTabId)).cmds.length, 0, 'handed over once');
+// A command left in the queue too long is dropped, not run late.
+await call({ type: 'cmd', action: 'seekBy', value: 5 }, 2);
+inBg('pendingCmds[0].queuedAt -= 5000');
+assert.equal((await call({ type: 'state', state: st(51) }, s.playerTabId)).cmds.length, 0);
+const dc = (await call({ type: 'diag:get' })).diag.commands;
+assert.equal(dc.queued, 2);
+assert.equal(dc.expired, 1);
+assert.equal(dc.failures.at(-1).error, 'Could not establish connection');
+tabHandlers[s.playerTabId] = realHandler;
 await call({ type: 'cmd', action: 'load', value: { videoId: 'xyz', t: 0 } }, 2);
 assert.equal((await call({ type: 'hello' }, s.playerTabId)).session.videoId, 'xyz');
 
@@ -109,10 +146,14 @@ assert.ok(!windows.has(s.playerWindowId));
 assert.ok(sent.some((m) => m.id === 2 && m.msg.type === 'session-ended'));
 assert.equal((await call({ type: 'hello' }, 2)).role, null);
 
-// restart uses remembered bounds; closing the player tab manually ends the session
+// restart uses remembered bounds, and a window Safari put elsewhere is moved back
+misplaceNextWindow = true;
 const r2 = await call({ type: 'start', videoId: 'abc', t: 0, screen: ctrlScreen }, 2);
 assert.equal(r2.session.ctrlScreen.sw, 1800);
-assert.equal(windows.get(r2.session.playerWindowId).left, mem.local.tvBounds.left);
+assert.equal(windows.get(r2.session.playerWindowId).left, 0);
+await sleep(1700);
+assert.equal(windows.get(r2.session.playerWindowId).left, mem.local.tvBounds.left, 'moved to the remembered spot');
+// closing the player tab manually ends the session
 sent.length = 0;
 tabs.delete(r2.session.playerTabId);
 await onRemoved(r2.session.playerTabId);
