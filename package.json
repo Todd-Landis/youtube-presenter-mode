@@ -9,7 +9,7 @@
     "test": "node tests/background.test.mjs && node tests/content.test.mjs",
     "check": "for f in extension/*.js extension/content/*.js; do node --check \"$f\" || exit 1; done",
     "icons": "swift scripts/make-icons.swift extension/icons",
-    "xcode": "./scripts/make-xcode-project.sh"
+    "install:mac": "./scripts/install-mac-app.sh"
   },
   "devDependencies": {
     "jsdom": "^25.0.1"

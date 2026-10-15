@@ -43,19 +43,28 @@ before it plays with sound.
 
 ### Permanent install
 
-Wrap the extension in an app with Xcode:
+A temporary extension disappears when Safari quits. To keep it installed,
+build it into a small Mac app:
 
-```bash
-sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-```
+1. Install **Xcode** from the App Store and open it once to finish setup.
+2. In Xcode ▸ Settings ▸ **Accounts**, add your Apple ID. A free account is
+   enough; it gives you an Apple Development certificate to sign with.
+3. Run:
 
-```bash
-npm run xcode
-```
+   ```bash
+   npm run install:mac
+   ```
 
-This runs `safari-web-extension-converter` and builds an ad-hoc signed app.
-Open the app once, then enable the extension in Safari ▸ Settings ▸ Extensions.
-Because the app is unsigned, "Allow unsigned extensions" still has to be on.
+   This converts the extension with `safari-web-extension-converter`, builds
+   and signs the app, copies it to `~/Applications`, and opens it once so
+   Safari registers the extension.
+4. In Safari ▸ Settings ▸ Extensions, remove any temporary copy and enable
+   **YouTube Presenter Mode**.
+
+Run `npm run install:mac` again after changing the code.
+
+If you skip step 2, the app is ad-hoc signed, and Safari only loads it while
+"Allow unsigned extensions" is on.
 
 ## Apple TV setup
 
@@ -149,7 +158,7 @@ extension/
   popup.*, diagnostics.*   toolbar popup and diagnostics page
   icons/
 scripts/
-  make-xcode-project.sh    Xcode wrapper for a permanent install
+  install-mac-app.sh       builds, signs and installs the Mac app (permanent install)
   make-icons.swift         icon generator
 tests/
 ```
