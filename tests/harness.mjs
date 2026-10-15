@@ -62,6 +62,12 @@ export class World {
       bridge: true, // page-world bridge loads (false = Safari-style failure, DOM fallbacks)
       scripting: false, // scripting.executeScript({world: MAIN}) works
       fullscreen: 'works', // windows.update({state:'fullscreen'}): 'works' | 'ignored' | 'afterLoad'
+      // While a window moves into or out of a fullscreen Space, WebKit can
+      // briefly report the main display as its screen.
+      fsGlitchMs: 500,
+      // A fullscreen request on a window that is already fullscreen toggles
+      // it back out (a naive toggleFullScreen: implementation).
+      fsToggles: true,
       dropToTab: 0, // chance tabs.sendMessage fails
       dropReplyToTab: 0, // chance the tab ran the message but the reply was lost
       dropToBg: 0, // chance runtime.sendMessage from a page fails
@@ -208,8 +214,23 @@ export class World {
   // ---- windows & tabs -----------------------------------------------------------
 
   screenAt(win) {
+    if (win.transitionUntil && Date.now() < win.transitionUntil) return SCREENS.mac;
     if (this.tvConnected && win.left >= SCREENS.tv.x) return SCREENS.tv;
     return SCREENS.mac;
+  }
+
+  // Enter or leave native fullscreen, with the brief wrong-screen moment and
+  // resize events on either side of it.
+  setFullscreen(win, on) {
+    if ((win.state === 'fullscreen') === on) return;
+    win.state = on ? 'fullscreen' : 'normal';
+    if (this.o.fsGlitchMs) {
+      win.transitionUntil = Date.now() + this.o.fsGlitchMs;
+      this.resized(win);
+      setTimeout(() => this.resized(win), this.o.fsGlitchMs + 5);
+    } else {
+      this.resized(win);
+    }
   }
 
   tabInfo(t) {
@@ -274,9 +295,10 @@ export class World {
     if (o.state === 'fullscreen') {
       const page = this.tabs.get(win.tabs[0])?.page;
       const early = !page || Date.now() - page.loadedAt < 1500;
-      if (this.o.fullscreen === 'works' || (this.o.fullscreen === 'afterLoad' && !early)) win.state = 'fullscreen';
+      const honoured = this.o.fullscreen === 'works' || (this.o.fullscreen === 'afterLoad' && !early);
+      if (honoured) this.setFullscreen(win, !(this.o.fsToggles && win.state === 'fullscreen'));
     } else if (o.state === 'normal') {
-      win.state = 'normal';
+      this.setFullscreen(win, false);
     }
     this.resized(win);
     return this.winInfo(win);
@@ -325,9 +347,7 @@ export class World {
 
   // ⌃⌘F / Esc on the TV.
   userExitFullscreen(winId) {
-    const win = this.windows.get(winId);
-    win.state = 'normal';
-    this.resized(win);
+    this.setFullscreen(this.windows.get(winId), false);
   }
 
   // The Apple TV sleeps or AirPlay drops: macOS moves its windows to the Mac.
@@ -669,6 +689,7 @@ class Page {
     const host = this.doc.getElementById('ytpm-overlay-host');
     if (!host) return null;
     const text = host.shadowRoot.textContent;
+    if (/Drag this window/i.test(text)) return 'placement';
     if (/fullscreen/i.test(text)) return 'fullscreen';
     if (/Click to start/i.test(text)) return 'gesture';
     if (/Drag this window/i.test(text)) return 'placement';

@@ -5,7 +5,7 @@ Three layers, from fast to thorough:
 | Command | What it covers | Time |
 |---|---|---|
 | `npm test` | Unit tests: background logic against mocked extension APIs, content scripts in jsdom | ~10 s |
-| `npm run test:system` | 33 end-to-end scenarios plus a fuzzer, against simulated Safari and YouTube | ~3 min |
+| `npm run test:system` | 35 end-to-end scenarios plus a fuzzer, against simulated Safari and YouTube | ~4 min |
 | Manual checklist below | The things only real Safari and a real Apple TV can show | ~10 min |
 
 ## The system harness
@@ -17,6 +17,8 @@ Three layers, from fast to thorough:
   - unload the background page mid-session (in-memory state lost, storage kept)
   - report new windows as `about:blank` first, or open them away from the requested position
   - ignore `windows.update({state: "fullscreen"})`, always or while the page is loading
+  - briefly report the main display while a window moves into or out of a fullscreen Space
+  - toggle a window back out of fullscreen if fullscreen is requested again
   - fail to load the page-world bridge, as Safari ignores the manifest's `world` key
   - close tabs, reload pages, disconnect the TV display, or have the user leave fullscreen
 
@@ -82,10 +84,12 @@ Found by reading the code, by checking real YouTube behaviour in a browser, and 
 
 | Problem | Effect | Fix |
 |---|---|---|
-| If you left fullscreen on the TV, the auto-retry could put it back within 4 s | Fighting the user | Leaving fullscreen yourself is detected and respected; F on the remote turns it back on |
+| While the TV window animated into fullscreen, it briefly reported being on the Mac screen, and that was taken for a TV disconnect | Went fullscreen, then dropped straight back to a window (and paused) | Leaving the TV only counts after 3 s, and never while a fullscreen change is settling; the TV's "drag this window" banner waits 1.5 s too |
+| A second fullscreen request on a window that already was fullscreen | Could toggle it back out | Automatic requests stop once fullscreen has worked on the page, and a request is skipped if the window already reports fullscreen |
+| If you left fullscreen on the TV, the auto-retry could put it back within 4 s | Fighting the user | Leaving fullscreen yourself is detected (once it has lasted 1.5 s) and respected; F on the remote turns it back on |
 | A playlist link reloads the TV page and loses element fullscreen | TV stayed windowed | Each new TV page gets a fresh set of fullscreen attempts, unless you turned fullscreen off |
 | The TV only reported its size twice a second | Fullscreen changes were noticed late | The TV reports immediately on resize |
-| The Apple TV sleeps or AirPlay drops while playing | macOS moved the TV window to the Mac screen, still fullscreen and playing | Playback pauses, the window leaves fullscreen, and the remote says the TV disconnected |
+| The Apple TV sleeps or AirPlay drops while playing | macOS moved the TV window to the Mac screen, still fullscreen and playing | Once that has held for 3 s, playback pauses, the window leaves fullscreen, and the remote says the TV disconnected |
 
 ### Keyboard
 

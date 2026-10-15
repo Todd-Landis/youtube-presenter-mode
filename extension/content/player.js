@@ -27,6 +27,8 @@ YTPM.Player = (() => {
   let wantedPlay = null;
   let ourPlayUntil = 0;
   let pauseCheck = 0;
+  let onCtrlScreenSince = 0;
+  const PLACEMENT_HOLD_MS = 1500;
 
   const STYLE = `
 html.ytpm-player, html.ytpm-player body { overflow: hidden !important; background: #000 !important; }
@@ -537,7 +539,17 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     }
     if (needGesture) return 'gesture';
     const scr = YTPM.screenInfo();
-    if (session.ctrlScreen && YTPM.sameScreen(scr, session.ctrlScreen)) return 'placement';
+    // Only once it has held: moving into or out of fullscreen can briefly
+    // report the main display.
+    if (session.ctrlScreen && YTPM.sameScreen(scr, session.ctrlScreen)) {
+      if (!onCtrlScreenSince) {
+        onCtrlScreenSince = Date.now();
+        setTimeout(updateOverlay, PLACEMENT_HOLD_MS + 50);
+      }
+      if (Date.now() - onCtrlScreenSince >= PLACEMENT_HOLD_MS) return 'placement';
+    } else {
+      onCtrlScreenSince = 0;
+    }
     if (needFullscreen && !document.fullscreenElement && !YTPM.fillsScreen(scr)) return 'fullscreen';
     return null;
   }

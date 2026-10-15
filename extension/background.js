@@ -313,11 +313,28 @@ function heartbeat(state) {
   hb.lastAt = now;
 }
 
+// How long a change has to hold before it counts. A window moving into or
+// out of a fullscreen Space can briefly report the main display.
+const OFF_TV_HOLD_MS = 3000;
+const UNFILL_HOLD_MS = 1500;
+const FS_SETTLE_MS = 6000; // after a fullscreen change we asked for
+
 async function trackScreen(s, state) {
-  const other = !sameScreen(state.screen, s.ctrlScreen);
+  const now = Date.now();
+  const onTvNow = !sameScreen(state.screen, s.ctrlScreen);
   const fills = fillsScreen(state.screen) || !!state.fs;
+  const fsSettling = now - Math.max(s.fsLastAttemptAt || 0, s.fsNormalRequestedAt || 0) < FS_SETTLE_MS;
   D.placement.playerScreen = state.screen;
-  D.placement.playerOnOtherScreen = other;
+  D.placement.playerOnOtherScreen = onTvNow;
+
+  // Leaving the TV only counts once it has held, and not while a fullscreen
+  // change we asked for is still settling.
+  let other = onTvNow;
+  if (onTvNow) s.offTvSince = 0;
+  else if (s.onOther) {
+    s.offTvSince = s.offTvSince || now;
+    if (now - s.offTvSince < OFF_TV_HOLD_MS || fsSettling) other = true;
+  }
   if (other !== s.onOther) {
     s.onOther = other;
     log('player', other ? 'player window is on another screen' : 'player window is on the controller screen', state.screen);
@@ -330,19 +347,29 @@ async function trackScreen(s, state) {
     await saveIf(s);
   }
 
-  // It filled the screen and stopped without us asking: the user left
-  // fullscreen on purpose (Esc, ⌃⌘F). Don't fight them.
-  if (fills !== s.fsSeen) {
-    if (!fills && other && Date.now() - (s.fsNormalRequestedAt || 0) > 4000) {
+  if (fills) {
+    s.unfillSince = 0;
+    if (!s.fsSeen) {
+      // Fullscreen worked on this page: no more automatic requests, since a
+      // repeated request can toggle Safari back out of fullscreen.
+      s.fsSeen = true;
+      s.fsAutoAttempts = AUTO_FS_ATTEMPTS;
+      await saveIf(s);
+    }
+  } else if (s.fsSeen && other) {
+    // It filled the screen and has stopped for a while without us asking:
+    // the user left fullscreen on purpose (Esc, ⌃⌘F). Don't fight them.
+    s.unfillSince = s.unfillSince || now;
+    if (now - s.unfillSince > UNFILL_HOLD_MS && now - (s.fsNormalRequestedAt || 0) > FS_SETTLE_MS) {
+      s.fsSeen = false;
       s.fsWanted = false;
       log('bg', 'user left fullscreen; not re-entering it automatically');
+      await saveIf(s);
     }
-    s.fsSeen = fills;
-    await saveIf(s);
   }
   if (!other) return;
 
-  if (!s.boundsSaved && !fills) {
+  if (!s.boundsSaved && !fills && onTvNow) {
     s.boundsSaved = true;
     try {
       const w = await ext.windows.get(s.playerWindowId);
@@ -353,11 +380,12 @@ async function trackScreen(s, state) {
     } catch {}
   }
   // Safari can ignore a fullscreen request made while the page is still
-  // loading, so try a few times, bringing the window forward after the first.
+  // loading, so try a few times (until it works once), bringing the window
+  // forward after the first.
   const n = s.fsAutoAttempts || 0;
-  if (s.fsWanted && !fills && n < AUTO_FS_ATTEMPTS && !fsInFlight && Date.now() - (s.fsLastAttemptAt || 0) > 4000) {
+  if (s.fsWanted && !fills && !s.fsSeen && onTvNow && n < AUTO_FS_ATTEMPTS && !fsInFlight && now - (s.fsLastAttemptAt || 0) > 4000) {
     s.fsAutoAttempts = n + 1;
-    s.fsLastAttemptAt = Date.now();
+    s.fsLastAttemptAt = now;
     await saveIf(s);
     tryWindowFullscreen('auto #' + (n + 1), false, { focus: n > 0, quiet: n + 1 < AUTO_FS_ATTEMPTS });
   }
@@ -388,9 +416,16 @@ async function tryWindowFullscreen(trigger, toNormal = false, { focus = false, q
   if (toNormal) s.fsNormalRequestedAt = Date.now();
   const r = { at: Date.now(), trigger, target: toNormal ? 'normal' : 'fullscreen', focus };
   try {
-    if (focus) await ext.windows.update(s.playerWindowId, { focused: true });
-    await ext.windows.update(s.playerWindowId, { state: toNormal ? 'normal' : 'fullscreen' });
-    r.call = 'ok';
+    // Never repeat a fullscreen request on a window that already is: in some
+    // implementations that toggles it back out.
+    const before = toNormal ? null : await ext.windows.get(s.playerWindowId).catch(() => null);
+    if (before?.state === 'fullscreen') {
+      r.call = 'skipped: already fullscreen';
+    } else {
+      if (focus) await ext.windows.update(s.playerWindowId, { focused: true });
+      await ext.windows.update(s.playerWindowId, { state: toNormal ? 'normal' : 'fullscreen' });
+      r.call = 'ok';
+    }
   } catch (e) {
     r.call = 'threw: ' + (e?.message || e);
   }

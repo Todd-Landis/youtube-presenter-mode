@@ -321,11 +321,36 @@ test('leaving fullscreen on the TV yourself is respected', async (world) => {
   noErrors(world);
 });
 
+test('going fullscreen stays fullscreen (transition glitch, repeated requests)', async (world) => {
+  const ctrl = await present(world);
+  await until(() => tvWin(world).state === 'fullscreen', 3000, 'fullscreen');
+  // Long enough for every automatic retry and the 2.5 s verification.
+  for (let i = 0; i < 24; i++) {
+    await sleep(500);
+    assert.equal(tvWin(world).state, 'fullscreen', `still fullscreen after ${(i + 1) / 2} s`);
+  }
+  assert.equal(tvVideo(world).v.paused, false, 'still playing');
+  assert.ok(!/disconnect/i.test(ctrl.toast() || ''), 'no false "TV disconnected"');
+  noErrors(world);
+});
+
+test('fullscreen ignored at first, Safari toggles on repeat requests: ends up fullscreen', async (world) => {
+  await present(world);
+  await until(() => tvWin(world).state === 'fullscreen', 9000, 'fullscreen on a retry');
+  await sleep(9000);
+  assert.equal(tvWin(world).state, 'fullscreen', 'no later request toggled it back out');
+  noErrors(world);
+}, { fullscreen: 'afterLoad' });
+
 test('TV display disconnects: playback pauses and the Mac is not taken over', async (world) => {
   const ctrl = await present(world);
   await until(() => tvWin(world).state === 'fullscreen', 3000, 'fullscreen');
+  await sleep(6000); // mid-video, not during the fullscreen animation
   world.disconnectTv();
-  await until(() => tvVideo(world).v.paused, 2500, 'paused');
+  // Confirmed after ~3 s, so a fullscreen animation can't trigger it.
+  await sleep(1500);
+  assert.equal(tvVideo(world).v.paused, false, 'not paused on a momentary blip');
+  await until(() => tvVideo(world).v.paused, 5000, 'paused');
   await until(() => tvWin(world).state === 'normal', 3500, 'out of fullscreen on the Mac');
   assert.match(ctrl.toast() || '', /disconnect/i);
   noErrors(world);
