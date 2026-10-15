@@ -47,8 +47,10 @@ A temporary extension disappears when Safari quits. To keep it installed,
 build it into a small Mac app:
 
 1. Install **Xcode** from the App Store and open it once to finish setup.
-2. In Xcode ▸ Settings ▸ **Accounts**, add your Apple ID. A free account is
-   enough; it gives you an Apple Development certificate to sign with.
+2. In Xcode ▸ Settings ▸ **Accounts**, add your Apple ID (a free account is
+   enough). Then select it, click **Manage Certificates…**, and add an
+   **Apple Development** certificate. Signed with it, the extension stays
+   enabled across Safari restarts with "Allow unsigned extensions" off.
 3. Run:
 
    ```bash
