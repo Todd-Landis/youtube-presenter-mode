@@ -401,20 +401,46 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     return 'navigate';
   }
 
+  // YouTube's play/pause button. Its label says "Pause" while YouTube itself
+  // considers the video playing.
+  const playButton = () => document.querySelector('#movie_player .ytp-play-button');
+  const youtubeThinksPlaying = () => {
+    const b = playButton();
+    const label = b && (b.getAttribute('data-title-no-tooltip') || b.getAttribute('aria-label') || b.title || '');
+    return label ? /^pause/i.test(label) : null;
+  };
+
   const A = {
     togglePlay: () => (video?.paused ? A.play() : A.pause()),
     play: async () => {
       if (!video) return;
       try {
+        // Playing the element directly lets us see Safari's autoplay refusal.
         await video.play();
         needGesture = false;
+        // Then bring YouTube's own player state in line, or it may pause again.
+        // (Not via its button: that's a toggle and could undo the play.)
+        if (bridge.ready) await bridge.call('play').catch(() => {});
       } catch (e) {
         needGesture = true;
         event('play-blocked', { name: e.name, message: e.message }, true);
       }
       updateOverlay();
     },
-    pause: () => video?.pause(),
+    // Pausing only the <video> leaves YouTube's player believing it's playing,
+    // and it resumes by itself after buffering or a quality switch. Pause
+    // through YouTube (API, else its button), then make sure it held.
+    pause: async () => {
+      if (!video) return;
+      if (bridge.ready) await bridge.call('pause').catch(() => {});
+      else if (youtubeThinksPlaying()) playButton()?.click();
+      if (!video.paused) video.pause();
+      await sleep(500);
+      if (!video.paused) {
+        video.pause();
+        event('pause-retried', { bridge: bridge.ready, youtubeThinksPlaying: youtubeThinksPlaying() });
+      }
+    },
     seekBy: (d) => seekTo((video?.currentTime || 0) + d),
     seekTo: (t) => seekTo(t),
     seekPercent: (n) => {
@@ -438,7 +464,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     setRate: (r) => setRate(r),
     toggleFullscreen: async () => {
       if (document.fullscreenElement) return void (await document.exitFullscreen().catch(() => {}));
-      return YTPM.send({ type: 'toggleWindowFullscreen' });
+      // This page knows whether it fills its screen; Safari's window.state may not.
+      return YTPM.send({ type: 'toggleWindowFullscreen', exit: YTPM.fillsScreen(YTPM.screenInfo()) });
     },
     load: loadVideo,
     next: () => (bridge.ready ? bridge.call('next') : null),

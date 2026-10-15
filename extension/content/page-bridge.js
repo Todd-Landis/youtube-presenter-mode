@@ -8,7 +8,6 @@
   if (window.__ytpmBridge) return;
   window.__ytpmBridge = true;
 
-  const via = document.currentScript ? 'script-tag' : 'manifest-main-world';
   let keepAlive = null;
 
   const player = () => {
@@ -21,7 +20,7 @@
     hello: () => {
       let api = false;
       try { api = !!player(); } catch {}
-      return { mainWorld: true, via, api };
+      return { mainWorld: true, api };
     },
     // In the player window, keep YouTube's "last activity" fresh so the
     // "Video paused. Continue watching?" prompt never fires on the TV.

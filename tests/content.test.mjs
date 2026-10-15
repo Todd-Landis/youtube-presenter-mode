@@ -36,7 +36,9 @@ function setup(url, hello, onSend) {
   const mp = w.document.getElementById('movie_player');
   const api = { cc: false, rate: 1, vol: 100, muted: false, calls: [] };
   Object.assign(mp, {
-    getPlayerState: () => (vs.paused ? 2 : 1), playVideo: () => v.play(), pauseVideo: () => v.pause(),
+    getPlayerState: () => (vs.paused ? 2 : 1),
+    playVideo: () => { api.calls.push(['playVideo']); return v.play(); },
+    pauseVideo: () => { api.calls.push(['pauseVideo']); v.pause(); },
     seekTo: (t) => { api.calls.push(['seekTo', t]); vs.currentTime = t; },
     getCurrentTime: () => vs.currentTime, getDuration: () => vs.duration,
     getPlaybackRate: () => api.rate, setPlaybackRate: (r) => { api.calls.push(['setPlaybackRate', r]); api.rate = r; vs.playbackRate = r; },
@@ -104,8 +106,9 @@ function setup(url, hello, onSend) {
   key('K', { shiftKey: true }); // shift+k: not a YouTube shortcut
   key('k', { metaKey: true }); // cmd+k: browser shortcut, leave alone
   key('j', {}, doc.getElementById('search')); // typing in search box
+  // Play/pause keys become explicit commands from the bar's state (playing → pause → play).
   assert.deepEqual(cmds(), [
-    ['togglePlay', undefined], ['togglePlay', undefined], ['seekBy', -10], ['seekBy', 5], ['volumeBy', 5],
+    ['pause', undefined], ['play', undefined], ['seekBy', -10], ['seekBy', 5], ['volumeBy', 5],
     ['toggleMute', undefined], ['toggleCaptions', undefined], ['toggleFullscreen', undefined],
     ['rateStep', 1], ['rateStep', -1], ['seekPercent', 7], ['next', undefined],
   ]);
@@ -114,6 +117,19 @@ function setup(url, hello, onSend) {
   // remote bar buttons
   sr.querySelectorAll('.row button')[1].click(); // −10
   assert.deepEqual(cmds().at(-1), ['seekBy', -10]);
+
+  // Pause from the bar, then a report taken just before the click arrives:
+  // it must not flip the bar back to "playing".
+  await deliver({ type: 'state', state: { t: 70, d: 600, paused: false, rate: 1, sentAt: Date.now(), title: 'On TV', videoId: 'abc' } });
+  const playBtn = sr.querySelector('.row button');
+  playBtn.click();
+  assert.deepEqual(cmds().at(-1), ['pause', undefined]);
+  await deliver({ type: 'state', state: { t: 70.4, d: 600, paused: false, rate: 1, sentAt: Date.now() - 200, title: 'On TV', videoId: 'abc' } });
+  assert.equal(playBtn.getAttribute('title'), 'Play/pause (k)');
+  assert.equal(playBtn.querySelector('path').getAttribute('d'), 'M8 5v14l11-7z', 'still shows the play icon (paused)');
+  playBtn.click();
+  assert.deepEqual(cmds().at(-1), ['play', undefined], 'second click plays, not a second pause');
+  await deliver({ type: 'state', state: { t: 71, d: 600, paused: false, rate: 1, sentAt: Date.now() + 1, title: 'On TV', videoId: 'abc' } });
 
   // SPA navigation to another video → loads on the TV
   w.history.pushState({}, '', '/watch?v=zzz');
@@ -152,6 +168,7 @@ function setup(url, hello, onSend) {
   const last = states.at(-1);
   assert.equal(last.title, 'API Title');
   assert.equal(last.bridge.mainWorld, true);
+  assert.equal(last.bridge.via, 'manifest');
   assert.equal(last.overlay, null);
 
   const cmd = async (action, value) => (await deliver({ type: 'cmd', action, value })).result;
@@ -167,9 +184,30 @@ function setup(url, hello, onSend) {
   assert.equal(api.vol, 95);
   await cmd('toggleMute');
   assert.equal(api.muted, true);
-  await cmd('togglePlay');
+  const count = (name) => api.calls.filter((c) => c[0] === name).length;
+  const pauses = count('pauseVideo');
+  await cmd('pause');
   assert.equal(vs.paused, true);
+  assert.equal(count('pauseVideo'), pauses + 1, 'paused through YouTube, not just the <video>');
+  const plays = count('playVideo');
+  await cmd('play');
+  assert.equal(vs.paused, false);
+  assert.equal(count('playVideo'), plays + 1, 'YouTube told it is playing');
+  // YouTube re-plays the element after a pause it didn't know about → pause holds anyway.
+  const realPauseVideo = w.document.getElementById('movie_player').pauseVideo;
+  w.document.getElementById('movie_player').pauseVideo = () => { vs.paused = true; setTimeout(() => { vs.paused = false; }, 100); };
+  await cmd('pause');
+  assert.equal(vs.paused, true, 'pause re-applied after YouTube resumed');
+  assert.ok(sent.some((m) => m.type === 'event' && m.name === 'pause-retried'));
+  w.document.getElementById('movie_player').pauseVideo = realPauseVideo;
+  await cmd('togglePlay');
+  assert.equal(vs.paused, false);
   assert.equal(await cmd('load', { videoId: 'zzz', t: 0 }), 'api');
+
+  // Fullscreen toggle tells the background which way to go.
+  await cmd('toggleFullscreen');
+  const fsMsg = sent.filter((m) => m.type === 'toggleWindowFullscreen').at(-1);
+  assert.equal(typeof fsMsg.exit, 'boolean');
 
   await deliver({ type: 'needFullscreenClick' });
   // jsdom's window fills its "screen" unless we shrink it

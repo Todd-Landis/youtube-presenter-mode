@@ -9,6 +9,7 @@ YTPM.Controller = (() => {
   let active = false;
   let session = null;
   let st = null; // last player state
+  let lastCmdAt = 0;
   let stAt = 0; // when it arrived
   let prevMuted = null;
   let ctrlVideoId = null;
@@ -245,11 +246,15 @@ YTPM.Controller = (() => {
   }
 
   function command(action, value) {
+    // Send an explicit play or pause matching what the bar shows. A toggle can
+    // undo itself when a state report crosses it in flight.
+    if (action === 'togglePlay' && st) action = st.paused || st.ended ? 'play' : 'pause';
+    lastCmdAt = Date.now();
     // Optimistic updates so the bar feels immediate.
     if (st) {
       const now = Date.now();
       const t = currentTime();
-      if (action === 'togglePlay') { st = { ...st, t, paused: !st.paused }; stAt = now; }
+      if (action === 'play' || action === 'pause') { st = { ...st, t, paused: action === 'pause', ended: false }; stAt = now; }
       if (action === 'seekBy') { st = { ...st, t: Math.max(0, t + value) }; stAt = now; }
       if (action === 'seekTo') { st = { ...st, t: value }; stAt = now; }
     }
@@ -458,6 +463,8 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
     switch (msg.type) {
       case 'state':
         if (!active && msg.session) enter(msg.session);
+        // A report taken before the last command would undo its optimistic update.
+        if (msg.state.sentAt < lastCmdAt) return { ok: true };
         st = msg.state;
         stAt = Date.now();
         render();
@@ -472,6 +479,7 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
         if (msg.name === 'airplay-disconnected') toast('AirPlay disconnected. Click the player window to reconnect.');
         if (msg.name === 'airplay-connected') toast('AirPlay connected.');
         if (msg.name === 'play-blocked') toast('Safari blocked playback in the player window. Click it once.');
+        if (msg.name === 'fullscreen-needs-click') toast('Safari needs one click on the TV to go fullscreen.');
         return { ok: true };
     }
     return { ok: false, error: 'unhandled ' + msg.type };

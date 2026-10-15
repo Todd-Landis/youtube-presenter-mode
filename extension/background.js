@@ -265,8 +265,9 @@ async function trackScreen(state, settings) {
 // Native window fullscreen needs no user gesture and survives page loads,
 // unlike element fullscreen. If Safari ignores it, the player asks for a click.
 async function tryWindowFullscreen(trigger, toNormal = false) {
-  const s = S;
+  const s = await loadSession();
   if (!s) return { ok: false };
+  await loadDiag();
   const r = { at: Date.now(), trigger, target: toNormal ? 'normal' : 'fullscreen' };
   try {
     await ext.windows.update(s.playerWindowId, { state: toNormal ? 'normal' : 'fullscreen' });
@@ -276,11 +277,18 @@ async function tryWindowFullscreen(trigger, toNormal = false) {
   }
   await delay(2500);
   try { r.windowStateAfter = (await ext.windows.get(s.playerWindowId)).state; } catch {}
-  r.playerFillsScreenAfter = fillsScreen(lastState?.screen);
+  // Ask the player directly; the last relayed state can be stale.
+  const fresh = await toTab(s.playerTabId, { type: 'getState' });
+  const fills = fillsScreen((fresh ?? lastState)?.screen) || !!fresh?.fs;
+  r.playerFillsScreenAfter = fills;
+  r.ok = toNormal ? !fills : fills;
   D.placement.windowFullscreen = r;
-  saveDiagSoon();
-  if (!toNormal && !r.playerFillsScreenAfter) toTab(s.playerTabId, { type: 'needFullscreenClick' });
-  return { ok: toNormal || r.playerFillsScreenAfter, ...r };
+  log('bg', 'window ' + r.target + (r.ok ? ' worked' : ' did not take'), r);
+  if (!toNormal && !fills) {
+    toTab(s.playerTabId, { type: 'needFullscreenClick' });
+    toTab(s.controllerTabId, { type: 'event', name: 'fullscreen-needs-click' });
+  }
+  return r;
 }
 
 async function onPlayerState(state, sender) {
@@ -347,8 +355,18 @@ async function handle(msg, sender) {
     case 'toggleWindowFullscreen': {
       const s = await loadSession();
       if (!s) return { ok: false };
-      const w = await ext.windows.get(s.playerWindowId);
-      return tryWindowFullscreen('F key', w.state === 'fullscreen');
+      // The player reports whether it fills its screen. Safari's window.state
+      // isn't a reliable signal for native fullscreen.
+      let exit = msg.exit;
+      if (typeof exit !== 'boolean') {
+        try { exit = (await ext.windows.get(s.playerWindowId)).state === 'fullscreen'; } catch { exit = false; }
+      }
+      return tryWindowFullscreen('remote', exit);
+    }
+    case 'injectBridge': {
+      if (!ext.scripting?.executeScript || !sender.tab) return { ok: false, error: 'scripting API unavailable' };
+      await ext.scripting.executeScript({ target: { tabId: sender.tab.id }, files: ['content/page-bridge.js'], world: 'MAIN' });
+      return { ok: true };
     }
     case 'focusPlayer': {
       const s = await loadSession();

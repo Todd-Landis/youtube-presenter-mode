@@ -134,24 +134,44 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
   };
 
   // Resolves to bridge info, or {mainWorld:false} if no page-world script answers.
+  // Safari ignores `world: "MAIN"` in the manifest, so the bridge usually
+  // arrives by one of the fallbacks. Each failure is kept for diagnostics.
   YTPM.initBridge = async () => {
     const hello = () => YTPM.bridge.call('hello', null, 700).catch(() => null);
-    let info = await hello();
-    if (!info) {
-      // Safari may not honour `world: "MAIN"` in the manifest; fall back to a
-      // <script src> tag pointing at the same file (web_accessible_resources).
-      try {
+    const errors = [];
+    const attempts = [
+      ['manifest', () => {}],
+      ['script-tag', () => {
+        // YouTube enforces Trusted Types; a policy keeps the src assignment legal.
+        let url = ext.runtime.getURL('content/page-bridge.js');
+        try {
+          url = trustedTypes.createPolicy('ytpm-bridge', { createScriptURL: (u) => u }).createScriptURL(url);
+        } catch {}
         const s = document.createElement('script');
-        s.src = ext.runtime.getURL('content/page-bridge.js');
+        s.src = url;
         s.onload = () => s.remove();
         (document.head || document.documentElement).append(s);
-        await YTPM.sleep(300);
+      }],
+      ['scripting', async () => {
+        const r = await YTPM.send({ type: 'injectBridge' });
+        if (!r?.ok) throw new Error(r?.error || 'no response');
+      }],
+    ];
+    let info = null;
+    for (const [via, inject] of attempts) {
+      try {
+        await inject();
+        if (via !== 'manifest') await YTPM.sleep(300);
         info = await hello();
       } catch (e) {
-        info = { mainWorld: false, injectError: String(e?.message || e) };
+        errors.push(via + ': ' + (e?.message || e));
+      }
+      if (info) {
+        info.via = via;
+        break;
       }
     }
-    YTPM.bridge.info = info || { mainWorld: false };
+    YTPM.bridge.info = info ? { ...info, errors } : { mainWorld: false, errors };
     YTPM.bridge.ready = !!info?.mainWorld;
     return YTPM.bridge.info;
   };

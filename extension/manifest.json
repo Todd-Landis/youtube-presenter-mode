@@ -22,7 +22,7 @@
   "background": {
     "scripts": ["background.js"]
   },
-  "permissions": ["tabs", "storage"],
+  "permissions": ["tabs", "storage", "scripting"],
   "host_permissions": ["*://www.youtube.com/*", "*://youtube.com/*"],
   "content_scripts": [
     {

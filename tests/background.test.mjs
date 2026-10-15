@@ -69,6 +69,24 @@ assert.ok(sent.some((m) => m.id === 2 && m.msg.type === 'state'), 'state relayed
 await new Promise((res) => setTimeout(res, 2700));
 assert.equal(windows.get(s.playerWindowId).state, 'fullscreen');
 assert.ok(sent.some((m) => m.msg.type === 'needFullscreenClick'), 'player asked for a click since it still did not fill the screen');
+assert.ok(sent.some((m) => m.id === 2 && m.msg.type === 'event' && m.msg.name === 'fullscreen-needs-click'), 'controller told too');
+
+// Remote fullscreen button: the player says which way to go.
+const filled = { ...tvScreen, iw: 1920, ih: 1080 };
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc', screen: tvScreen } : { ok: true, echo: msg });
+const exitRes = await call({ type: 'toggleWindowFullscreen', exit: true }, s.playerTabId);
+assert.equal(windows.get(s.playerWindowId).state, 'normal');
+assert.equal(exitRes.ok, true, 'left fullscreen');
+sent.length = 0;
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc', screen: filled } : { ok: true, echo: msg });
+const enterRes = await call({ type: 'toggleWindowFullscreen', exit: false }, s.playerTabId);
+assert.equal(windows.get(s.playerWindowId).state, 'fullscreen');
+assert.equal(enterRes.ok, true, 'entered fullscreen');
+assert.ok(!sent.some((m) => m.msg.type === 'needFullscreenClick'), 'no click needed when it worked');
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc' } : { ok: true, echo: msg });
+
+// Bridge injection reports a missing scripting API instead of throwing.
+assert.equal((await call({ type: 'injectBridge' }, s.playerTabId)).ok, false);
 
 // state from a non-player tab is rejected
 assert.equal((await call({ type: 'state', state: st(1) }, 2)).stale, true);
