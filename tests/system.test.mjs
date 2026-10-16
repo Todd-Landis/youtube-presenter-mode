@@ -351,8 +351,8 @@ test('TV display disconnects: playback pauses and the Mac is not taken over', as
   await sleep(1500);
   assert.equal(tvVideo(world).v.paused, false, 'not paused on a momentary blip');
   await until(() => tvVideo(world).v.paused, 5000, 'paused');
+  await until(() => /disconnect/i.test(ctrl.toast() || ''), 2000, 'remote says the TV disconnected');
   await until(() => tvWin(world).state === 'normal', 3500, 'out of fullscreen on the Mac');
-  assert.match(ctrl.toast() || '', /disconnect/i);
   noErrors(world);
 });
 
@@ -369,7 +369,7 @@ for (const bridge of [true, false]) {
     ctrl.spaNavigate('/watch?v=vidBravo002&t=42s');
     await until(() => tvVideo(world)?.s.id === 'vidBravo002', 4000, 'TV switched again');
     await until(() => tvVideo(world).now() >= 41, 2000, 'started at the link timestamp');
-    assert.equal(world.session().videoId, 'vidBravo002');
+    assert.equal(world.session().key, 'vidBravo002');
     assert.equal(world.playerWindows().length, 1);
     noErrors(world);
   }, { bridge });
@@ -443,6 +443,152 @@ test('holding a key: toggles fire once, seeks repeat; IME input ignored', async 
   await sleep(600);
   assert.equal(tvVideo(world).v.paused, true, 'typing in a comment ignored');
   noErrors(world);
+});
+
+// ---- Twitch ------------------------------------------------------------------------
+
+const TW = 'https://www.twitch.tv/';
+
+async function presentTwitch(world, path = 'streamerone') {
+  const ctrl = await world.openController(TW + path);
+  await until(() => ctrl.presenterButton(), 3000, 'presenter button in Twitch controls');
+  ctrl.userClick(ctrl.presenterButton());
+  await until(() => world.playerPage()?.listener, 4000, 'player window loaded');
+  return ctrl;
+}
+
+test('Twitch live: button in the controls, TV fills, LIVE, pause/play, End', async (world) => {
+  const ctrl = await presentTwitch(world);
+  const btn = ctrl.presenterButton();
+  assert.ok(btn.closest('.player-controls__right-control-group'), 'button sits in the right control group');
+  assert.ok(btn.closest('#ytpm-btn-wrap').nextElementSibling.contains(ctrl.doc.querySelector('[data-a-target="player-fullscreen-button"]')), 'before fullscreen');
+  assert.match(world.tabs.get(world.session().playerTabId).url, /^https:\/\/www\.twitch\.tv\/streamerone$/);
+  await until(() => ctrl.bar()?.title === 'streamerone', 4000, 'bar title');
+  await until(() => /LIVE/.test(ctrl.bar().time), 2000, 'LIVE label');
+  const fill = tv(world).doc.querySelector('[data-ytpm-fill]');
+  assert.equal(fill?.getAttribute('data-a-target'), 'video-player', 'the Twitch player container fills the TV');
+  assert.ok(tv(world).doc.querySelector('[data-a-target="video-ref"][data-ytpm-fill-path]'), 'wrappers stretched');
+  await until(() => tvWin(world).state === 'fullscreen', 3000, 'fullscreen');
+  assert.equal(ctrl.yt.v.paused, true, 'Mac stream paused');
+  assert.ok(ctrl.doc.querySelector('[data-a-target="video-player"] > #ytpm-shield'), 'shield over the Mac player');
+  await until(() => !ctrl.bar().showsPaused, 1500, 'bar shows playing');
+  ctrl.key('k');
+  await until(() => tvVideo(world).v.paused, 1500, 'TV paused');
+  assert.equal(tv(world).doc.querySelector('[data-a-target="player-play-pause-button"]').getAttribute('data-a-player-state'), 'paused', "Twitch's own state agrees");
+  ctrl.key(' ');
+  await until(() => !tvVideo(world).v.paused, 1500, 'TV playing');
+  const t = tvVideo(world).now();
+  ctrl.key('5');
+  ctrl.key('>', { shiftKey: true });
+  await sleep(800);
+  assert.ok(tvVideo(world).now() < t + 3 && tvVideo(world).s.rate === 1, 'no percentage seek or speed change on live');
+  ctrl.key('k', {}, ctrl.doc.querySelector('[data-a-target="chat-input"]'));
+  await sleep(500);
+  assert.equal(tvVideo(world).v.paused, false, 'typing in chat stays in chat');
+  ctrl.barButton('End').click();
+  await until(() => world.playerWindows().length === 0 && !ctrl.bar(), 3000, 'ended');
+  assert.equal(ctrl.yt.v.muted, false);
+  noErrors(world);
+});
+
+test('Twitch: switching channel in the Mac tab switches the TV', async (world) => {
+  const ctrl = await presentTwitch(world);
+  await until(() => tvWin(world)?.state === 'fullscreen', 3000, 'fullscreen');
+  ctrl.spaNavigate('/streamertwo'); // no YouTube-style event: the URL just changes
+  await until(() => tv(world)?.listener && tvVideo(world)?.s.id === 'live:streamertwo', 5000, 'TV on the new channel');
+  await until(() => ctrl.bar().title === 'streamertwo', 3000, 'bar title');
+  assert.equal(tvWin(world).state, 'fullscreen', 'still fullscreen after the page load');
+  assert.equal(world.session().key, 'live:streamertwo');
+  await sleep(500);
+  assert.equal(ctrl.yt.v.paused, true, 'Mac copy held');
+  ctrl.spaNavigate('/directory');
+  await sleep(1200);
+  assert.equal(tvVideo(world).s.id, 'live:streamertwo', 'browsing the directory leaves the TV alone');
+  noErrors(world);
+});
+
+test('Twitch VOD: starts at the Mac position, seeks work', async (world) => {
+  const ctrl = await world.openController(TW + 'videos/111?t=10m0s');
+  await until(() => ctrl.presenterButton() && ctrl.yt.now() >= 599, 3000, 'VOD at 10:00');
+  ctrl.userClick(ctrl.presenterButton());
+  await until(() => tv(world)?.listener, 4000, 'TV loaded');
+  assert.match(world.tabs.get(world.session().playerTabId).url, /videos\/111\?t=10m\ds/);
+  await until(() => near(tvVideo(world).now(), 601, 3), 3000, 'TV near 10:00');
+  await until(() => !ctrl.bar().showsPaused, 1500, 'bar shows playing');
+  const t = tvVideo(world).now();
+  ctrl.key('l');
+  await until(() => tvVideo(world).now() >= t + 9, 1500, '+10 s');
+  noErrors(world);
+});
+
+test('Twitch mature-content gate on the TV is accepted', async (world) => {
+  const ctrl = await presentTwitch(world);
+  ctrl.spaNavigate('/maturechan');
+  await until(() => tvVideo(world)?.s.id === 'live:maturechan', 5000, 'TV on the gated channel');
+  await until(() => !tvVideo(world).v.paused, 7000, 'gate accepted, playing');
+  noErrors(world);
+});
+
+// ---- any other site --------------------------------------------------------------
+
+const SITE = 'https://videos.example.com/';
+
+test('any site: start from the toolbar, main video (not the decoy) fills the TV', async (world) => {
+  const ctrl = await world.openController(SITE + 'films/one');
+  ctrl.yt.v.play();
+  await sleep(1500);
+  assert.equal(ctrl.presenterButton(), null, 'no in-page button on unknown sites');
+  const r = await world.popupStart();
+  assert.notEqual(r?.ok, false, 'popup start accepted');
+  await until(() => tv(world)?.listener, 4000, 'TV loaded');
+  assert.equal(world.tabs.get(world.session().playerTabId).url, SITE + 'films/one');
+  await until(() => ctrl.bar()?.title === 'Film one', 4000, 'bar title from og:title');
+  const main = tv(world).doc.querySelector('.player-shell video');
+  await until(() => main.hasAttribute('data-ytpm-fill'), 2000, 'main video fills');
+  assert.equal(tv(world).doc.querySelector('header video').hasAttribute('data-ytpm-fill'), false, 'decoy left alone');
+  await until(() => !tvVideo(world).v.paused && near(tvVideo(world).now(), ctrl.yt.v.currentTime + 1, 3), 3000, 'TV playing from the Mac position');
+  assert.equal(ctrl.yt.v.paused, true, 'Mac copy paused');
+  assert.equal(ctrl.bar().warn, null);
+  await until(() => !ctrl.bar().showsPaused, 1500, 'bar shows playing');
+  ctrl.key('k');
+  await until(() => tvVideo(world).v.paused, 1500, 'paused');
+  ctrl.key('7');
+  await until(() => near(tvVideo(world).now(), 168, 1), 1500, '70 %');
+  ctrl.key('c'); // no text tracks: nothing to toggle, nothing breaks
+  ctrl.key('N', { shiftKey: true }); // no "next" here
+  await sleep(500);
+  world.shortcut(); // ⌥⇧P ends it
+  await until(() => world.playerWindows().length === 0 && !ctrl.bar(), 3000, 'ended by the shortcut');
+  assert.ok(near(ctrl.yt.v.currentTime, 168, 1.5), 'Mac parked at the TV position');
+  noErrors(world);
+});
+
+test('any site: the site\'s own scrubber on the Mac moves the TV', async (world) => {
+  const ctrl = await world.openController(SITE + 'films/two');
+  ctrl.yt.v.play();
+  await sleep(500);
+  world.shortcut();
+  await until(() => tv(world)?.listener && ctrl.bar(), 4000, 'presenting');
+  await sleep(1800);
+  ctrl.clickTimestamp(90);
+  await until(() => near(tvVideo(world).now(), 90, 2), 2000, 'TV at 90 s');
+  noErrors(world);
+});
+
+test('any site: a page without a video says so', async (world) => {
+  const ctrl = await world.openController(SITE + 'no-video');
+  await world.popupStart();
+  await until(() => /No video found/.test(ctrl.toast() || ''), 2000, 'told there is no video');
+  assert.equal(world.playerWindows().length, 0);
+  noErrors(world);
+});
+
+test('idle pages stay quiet: no messages to the background without a session', async (world) => {
+  await world.openController(SITE + 'films/one');
+  await world.openController('vidAlpha001');
+  await world.openController(TW + 'streamerone');
+  await sleep(800);
+  assert.equal(world.bgMessages('hello').length, 0, 'no hello from idle pages');
 });
 
 // ---- other modes ---------------------------------------------------------------------
@@ -519,6 +665,11 @@ for (const t of tests) {
   } catch (e) {
     results.push({ name: t.name, ok: false, error: e.message });
     console.log(`  FAIL ${t.name}\n       ${e.message.split('\n').slice(0, 6).join('\n       ')}`);
+    // Full detail for later: SYSTEM_TEST_LOG=path keeps every failure's errors.
+    if (process.env.SYSTEM_TEST_LOG) {
+      const fs = await import('node:fs');
+      fs.appendFileSync(process.env.SYSTEM_TEST_LOG, `\n=== ${t.name}\n${e.stack}\n${world.errors.join('\n---\n')}\n`);
+    }
     if (world.errors.length) console.log('       script errors:', world.errors.slice(0, 3).join('\n       '));
   } finally {
     await world.dispose();

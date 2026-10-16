@@ -1,9 +1,10 @@
-// Player role: the YouTube window that actually plays. In "extended" mode it
-// sits fullscreen on the TV display; in "airplay" mode it stays on the Mac and
-// routes its <video> to the Apple TV.
+// Player role: the window that actually plays. In "extended" mode it sits
+// fullscreen on the TV display; in "airplay" mode it stays on the Mac and
+// routes its <video> to the Apple TV. Site specifics come from YTPM.site.
 'use strict';
 YTPM.Player = (() => {
   const { h, bridge, sleep, clamp } = YTPM;
+  const site = () => YTPM.site;
   const DEFAULT_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
   let session = null;
@@ -30,29 +31,34 @@ YTPM.Player = (() => {
   let onCtrlScreenSince = 0;
   const PLACEMENT_HOLD_MS = 1500;
 
-  const STYLE = `
+  // Shared CSS for the TV window. Sites that fill with the top layer
+  // (popover) mark the element to blow up with data-ytpm-fill and the
+  // wrappers between it and the video with data-ytpm-fill-path.
+  const BASE_CSS = `
 html.ytpm-player, html.ytpm-player body { overflow: hidden !important; background: #000 !important; }
-html.ytpm-player :is(#masthead-container, ytd-masthead, tp-yt-app-drawer, ytd-mini-guide-renderer, #secondary, #below, #chat) { visibility: hidden !important; }
-html.ytpm-player #movie_player {
+html.ytpm-player [data-ytpm-fill][popover], html.ytpm-player [data-ytpm-fill].ytpm-fill-fixed {
   position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important;
-  max-width: none !important; max-height: none !important; margin: 0 !important;
-  z-index: 2147483000 !important; background: #000 !important;
+  max-width: none !important; max-height: none !important; margin: 0 !important; padding: 0 !important;
+  border: 0 !important; background: #000 !important; overflow: hidden !important; transform: none !important;
+  z-index: 2147483000 !important; display: block !important;
 }
-html.ytpm-player #movie_player .html5-video-container { position: absolute !important; inset: 0 !important; width: 100% !important; height: 100% !important; }
-html.ytpm-player #movie_player video.html5-main-video {
-  position: absolute !important; left: 0 !important; top: 0 !important;
-  width: 100% !important; height: 100% !important; object-fit: contain !important;
+html.ytpm-player [data-ytpm-fill]::backdrop { background: #000; }
+html.ytpm-player [data-ytpm-fill-path] {
+  position: absolute !important; inset: 0 !important; width: 100% !important; height: 100% !important;
+  max-width: none !important; max-height: none !important; margin: 0 !important; padding: 0 !important; transform: none !important;
 }
-html.ytpm-player #movie_player :is(.ytp-chrome-top, .ytp-chrome-bottom, .ytp-gradient-top, .ytp-gradient-bottom,
-  .ytp-pause-overlay, .ytp-ce-element, .ytp-cards-teaser, .ytp-cards-button, .ytp-watermark,
-  .ytp-paid-content-overlay, .ytp-tooltip, .ytp-bezel, .ytp-bezel-text-wrapper, .ytp-overlay-bottom-right,
-  .ytp-suggested-action, .ytp-iv-player-content) { opacity: 0 !important; pointer-events: none !important; }
-html.ytpm-player #movie_player, html.ytpm-player #movie_player * { cursor: none !important; }
+html.ytpm-player [data-ytpm-fill] video { position: absolute !important; inset: 0 !important; width: 100% !important; height: 100% !important; }
+html.ytpm-player [data-ytpm-fill] video, html.ytpm-player video[data-ytpm-fill] { object-fit: contain !important; }
+html.ytpm-player [data-ytpm-fill-ancestor] {
+  transform: none !important; filter: none !important; perspective: none !important; contain: none !important;
+  will-change: auto !important; z-index: 2147483000 !important;
+}
+html.ytpm-player [data-ytpm-fill], html.ytpm-player [data-ytpm-fill] * { cursor: none !important; }
 `;
 
   const OVERLAY_CSS = `
 :host { all: initial; }
-.backdrop { position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center;
+.backdrop { position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center; pointer-events: auto;
   background: rgba(0,0,0,.72); cursor: pointer; color: #fff;
   font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
 .card { text-align: center; max-width: 680px; margin: 24px; padding: 40px 48px; border-radius: 28px;
@@ -78,7 +84,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       icon: 'play',
       title: 'Click to start playback',
       body: 'Safari blocked autoplay with sound in this window. One click here fixes it.',
-      tip: 'To skip this step: Safari ▸ Settings ▸ Websites ▸ Auto-Play ▸ youtube.com ▸ Allow All Auto-Play.',
+      tip: 'To skip this step: Safari ▸ Settings ▸ Websites ▸ Auto-Play ▸ this site ▸ Allow All Auto-Play.',
     },
     fullscreen: {
       icon: 'fullscreen',
@@ -96,13 +102,57 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     document.documentElement.classList.add('ytpm-player');
     if (!document.getElementById('ytpm-player-style')) {
       const s = h('style', { id: 'ytpm-player-style' });
-      s.textContent = STYLE;
+      s.textContent = BASE_CSS + (site().playerCss || '');
       document.documentElement.append(s);
     }
   }
 
   function unprepare() {
     document.documentElement.classList.remove('ytpm-player');
+    clearFill();
+  }
+
+  // ---- filling the TV --------------------------------------------------------------
+  // Sites using the top layer: their player element is shown as a popover,
+  // which escapes every transform, z-index and overflow on the page.
+  let fillEl = null;
+
+  function applyFill() {
+    if (!active || site().fill !== 'popover' || !video) return;
+    const target = site().fillTarget(video) || video;
+    if (fillEl && fillEl !== target) clearFill();
+    fillEl = target;
+    target.setAttribute('data-ytpm-fill', '');
+    for (let e = video.parentElement; e && e !== target && target.contains(e); e = e.parentElement) {
+      e.setAttribute('data-ytpm-fill-path', '');
+    }
+    if (typeof target.showPopover === 'function') {
+      if (!target.hasAttribute('popover')) target.setAttribute('popover', 'manual');
+      try {
+        if (!target.matches(':popover-open')) {
+          target.showPopover();
+          raiseOverlay();
+        }
+      } catch {}
+    } else {
+      // No top layer: fixed position, with ancestors that would trap it neutralised.
+      target.classList.add('ytpm-fill-fixed');
+      for (let e = target.parentElement; e && e !== document.documentElement; e = e.parentElement) {
+        e.setAttribute('data-ytpm-fill-ancestor', '');
+      }
+    }
+  }
+
+  function clearFill() {
+    if (fillEl) {
+      try { if (fillEl.matches(':popover-open')) fillEl.hidePopover(); } catch {}
+      fillEl.removeAttribute('popover');
+      fillEl.classList.remove('ytpm-fill-fixed');
+    }
+    for (const a of ['data-ytpm-fill', 'data-ytpm-fill-path', 'data-ytpm-fill-ancestor']) {
+      document.querySelectorAll(`[${a}]`).forEach((e) => e.removeAttribute(a));
+    }
+    fillEl = null;
   }
 
   function start(hello) {
@@ -113,7 +163,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     bindVideo();
     timers.push(setInterval(bindVideo, 1000));
     timers.push(setInterval(() => report('tick'), 500));
-    timers.push(setInterval(dismissStillWatching, 5000));
+    timers.push(setInterval(dismissPrompts, 5000));
     document.addEventListener('yt-navigate-finish', () => { bindVideo(); report('nav'); });
     document.addEventListener('fullscreenchange', () => { updateOverlay(); report('fullscreen'); });
     document.addEventListener('visibilitychange', () => report('visibility'));
@@ -147,8 +197,9 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
   // ---- video binding -----------------------------------------------------------
 
   function bindVideo() {
-    const v = YTPM.findVideo();
-    if (!v || v === video) return;
+    const v = site().findVideo();
+    // Re-apply the fill each time: sites re-render their players.
+    if (!v || v === video) return void applyFill();
     video = v;
     v.addEventListener('timeupdate', () => { if (Date.now() - lastSentAt > 450) report('timeupdate'); });
     for (const t of ['play', 'pause', 'ratechange', 'volumechange', 'seeked', 'ended']) {
@@ -175,6 +226,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       hasManagedMediaSource: typeof globalThis.ManagedMediaSource === 'function',
       remoteState: v.remote?.state ?? null,
     });
+    applyFill();
     if (!didInitialPlayback) {
       // Through the command queue, so commands that arrive meanwhile run after it.
       const queueInitial = () => { cmdChain = cmdChain.then(initialPlayback).catch(() => {}); };
@@ -187,9 +239,13 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     if (didInitialPlayback || !video) return;
     didInitialPlayback = true;
     // Only resume a position meant for the video this page is showing (after
-    // an autoplay-next and a reload, the URL is a different video).
-    const sameVideo = YTPM.parseWatch(location.href).videoId === session.videoId;
-    const t = sameVideo ? session.startT || 0 : 0;
+    // an autoplay-next and a reload, the URL is a different video), never on a
+    // live stream, and on generic sites only if it's evidently the same video
+    // (a pre-roll, say, has a different length).
+    const sameVideo = site().currentKey() === session.key;
+    const finiteVideo = Number.isFinite(video.duration);
+    const sameLength = !session.d || !finiteVideo || Math.abs(video.duration - session.d) < 3;
+    const t = sameVideo && finiteVideo && sameLength ? session.startT || 0 : 0;
     if (t > 1 && Math.abs(video.currentTime - t) > 2) await seekTo(t);
     // In AirPlay mode, wait for the user's click so audio doesn't start on the Mac first.
     if (session.mode === 'airplay') return updateOverlay();
@@ -233,28 +289,23 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     }
   }
 
-  // YouTube's "Video paused. Continue watching?" prompt; nobody is at the TV to click it.
-  function dismissStillWatching() {
-    const dialogs = document.querySelectorAll(
-      'ytd-popup-container yt-confirm-dialog-renderer, ytd-popup-container ytd-confirm-dialog-renderer');
-    for (const d of dialogs) {
-      if (!d.offsetParent || !/continue watching|still watching/i.test(d.textContent || '')) continue;
-      const btn = d.querySelector('#confirm-button button, #confirm-button');
-      if (!btn) continue;
-      btn.click();
-      event('still-watching-dismissed');
-      if (video?.paused) A.play();
-    }
+  // Prompts nobody is at the TV to answer ("Continue watching?", content gates).
+  function dismissPrompts() {
+    const what = site().dismissPrompts?.();
+    if (!what) return;
+    event('prompt-dismissed', { what });
+    if (video?.paused && wantedPlay !== 'pause') A.play();
   }
 
   // ---- state reporting -----------------------------------------------------------
 
   const finite = (n) => (Number.isFinite(n) ? n : null);
-  const ccButton = () => document.querySelector('#movie_player .ytp-subtitles-button');
+  const isLive = () => (video ? video.duration === Infinity || lastLive : false);
+  let lastLive = false;
 
   async function snapshot() {
     const v = video;
-    const btn = ccButton();
+    const cc = site().captions;
     const q = v?.getVideoPlaybackQuality?.();
     const s = {
       seq: ++seq,
@@ -266,11 +317,12 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       rate: v?.playbackRate ?? 1,
       muted: !!v?.muted,
       vol: v ? Math.round(v.volume * 100) : 100,
-      cc: btn?.getAttribute('aria-pressed') === 'true',
-      ccAvail: !!btn && getComputedStyle(btn).display !== 'none',
-      title: document.querySelector('ytd-watch-metadata h1')?.textContent?.trim() ||
-        document.title.replace(/ - YouTube$/, ''),
-      videoId: YTPM.parseWatch(location.href).videoId,
+      cc: !!cc?.on(),
+      ccAvail: !!cc?.available(),
+      title: site().title(),
+      key: site().currentKey(),
+      site: site().id,
+      hasNext: !!site().hasNext,
       rates: null,
       wireless: isWireless(),
       screen: YTPM.screenInfo(),
@@ -282,7 +334,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       bridge: bridge.info,
       ran: ranCmds.slice(-20),
       live: v ? v.duration === Infinity : false,
-      error: playerError(),
+      error: site().error(),
     };
     if (bridge.ready) {
       try {
@@ -291,7 +343,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
         s.muted = b.muted;
         if (b.cc != null) s.cc = b.cc;
         s.title = b.title || s.title;
-        s.videoId = b.videoId || s.videoId;
+        s.key = b.videoId || s.key;
         if (b.live || (b.d > 86400 && !Number.isFinite(v?.duration))) s.live = true;
         s.error = b.error || s.error;
         s.rates = b.rates;
@@ -299,14 +351,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       } catch {}
     }
     if (s.live) s.d = null;
+    lastLive = s.live;
     return s;
-  }
-
-  // YouTube's error screen ("Video unavailable" and the like).
-  function playerError() {
-    const el = document.querySelector('#movie_player .ytp-error');
-    if (!el || getComputedStyle(el).display === 'none') return null;
-    return el.querySelector('.ytp-error-content-wrap-reason')?.textContent?.trim() || 'unavailable';
   }
 
   // A report requested while one is in flight runs right after it, so play,
@@ -400,11 +446,12 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
         if (s.cc != null) return s.cc;
       } catch {}
     }
-    return ccButton()?.getAttribute('aria-pressed') === 'true';
+    return !!site().captions?.on();
   }
 
-  // Captions go through the player API, falling back to clicking YouTube's own
-  // (hidden) CC button. A synthetic "c" keypress proved unreliable.
+  // Captions go through the player API, falling back to the site's own
+  // (hidden) CC button or the video's text tracks. A synthetic "c" keypress
+  // proved unreliable.
   async function toggleCaptions() {
     if (bridge.ready) {
       const before = await ccState();
@@ -414,8 +461,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
         if ((await ccState()) !== before) return 'api';
       } catch {}
     }
-    ccButton()?.click();
-    return 'button';
+    site().captions?.toggle();
+    return 'site';
   }
 
   async function availableRates() {
@@ -429,39 +476,17 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
   }
 
   async function setRate(r) {
+    if (isLive()) return; // live streams play at 1×
     if (bridge.ready) {
       try { return void (await bridge.call('setRate', r)); } catch {}
     }
     if (video) video.playbackRate = r;
   }
 
-  async function loadVideo({ videoId, list, index, t }) {
-    if (!videoId) return 'ignored';
-    if (!list && bridge.ready) {
-      try {
-        await bridge.call('loadVideo', { videoId, t });
-        return 'api';
-      } catch {}
-    }
-    // Playlists (and no-bridge) take a full page load. Window fullscreen survives it.
-    const u = new URL('https://www.youtube.com/watch');
-    u.searchParams.set('v', videoId);
-    if (list) u.searchParams.set('list', list);
-    if (index) u.searchParams.set('index', index);
-    if (t) u.searchParams.set('t', Math.floor(t) + 's');
-    u.hash = YTPM.PLAYER_HASH;
-    YTPM.navigate(u.href);
-    return 'navigate';
+  async function loadVideo(item) {
+    if (!item?.key) return 'ignored';
+    return site().load(item);
   }
-
-  // YouTube's play/pause button. Its label says "Pause" while YouTube itself
-  // considers the video playing.
-  const playButton = () => document.querySelector('#movie_player .ytp-play-button');
-  const youtubeThinksPlaying = () => {
-    const b = playButton();
-    const label = b && (b.getAttribute('data-title-no-tooltip') || b.getAttribute('aria-label') || b.title || '');
-    return label ? /^pause/i.test(label) : null;
-  };
 
   const A = {
     togglePlay: () => (video?.paused ? A.play() : A.pause()),
@@ -473,7 +498,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
         // Playing the element directly lets us see Safari's autoplay refusal.
         await video.play();
         needGesture = false;
-        // Then bring YouTube's own player state in line, or it may pause again.
+        // Then bring the site's own player state in line, or it may pause again.
         // (Not via its button: that's a toggle and could undo the play.)
         if (bridge.ready) await bridge.call('play').catch(() => {});
       } catch (e) {
@@ -482,13 +507,13 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       }
       updateOverlay();
     },
-    // Pausing only the <video> leaves YouTube's player believing it's playing,
-    // and it resumes by itself after buffering or a quality switch. Pause
-    // through YouTube (API, else its button), then make sure it held.
+    // Pausing only the <video> can leave the site's player believing it's
+    // playing, so it may resume by itself. Pause through the site (API, else
+    // its button), then make sure it held.
     pause: async () => {
       if (!video) return;
       if (bridge.ready) await bridge.call('pause').catch(() => {});
-      else if (youtubeThinksPlaying()) playButton()?.click();
+      else if (site().siteThinksPlaying?.()) site().playButton?.()?.click();
       if (!video.paused) video.pause();
       // Check it held a moment later, without holding up the next command;
       // a play that arrives meanwhile cancels the check.
@@ -496,14 +521,14 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       setTimeout(() => {
         if (token !== pauseCheck || wantedPlay === 'play' || !video || video.paused) return;
         video.pause();
-        event('pause-retried', { bridge: bridge.ready, youtubeThinksPlaying: youtubeThinksPlaying() });
+        event('pause-retried', { bridge: bridge.ready, siteThinksPlaying: site().siteThinksPlaying?.() ?? null });
       }, 500);
     },
     seekBy: (d) => seekTo((video?.currentTime || 0) + d),
     seekTo: (t) => seekTo(t),
     seekPercent: (n) => {
       const d = duration();
-      if (d && Number.isFinite(d) && d < 86400) return seekTo((d * n) / 10);
+      if (!isLive() && d && d < 86400) return seekTo((d * n) / 10);
     },
     volumeBy: async (d) => {
       const cur = await volume();
@@ -526,7 +551,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       return YTPM.send({ type: 'toggleWindowFullscreen', exit: YTPM.fillsScreen(YTPM.screenInfo()) });
     },
     load: loadVideo,
-    next: () => (bridge.ready ? bridge.call('next') : null),
+    next: () => site().next?.() ?? null,
   };
 
   // ---- overlay -------------------------------------------------------------------------
@@ -580,6 +605,22 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     }
     document.documentElement.append(host);
     overlay = host;
+    raiseOverlay();
+  }
+
+  // Our prompts sit in the top layer too, above a filled player.
+  function raiseOverlay() {
+    const host = overlay;
+    if (!host || typeof host.showPopover !== 'function') return;
+    try {
+      if (!host.hasAttribute('popover')) {
+        host.setAttribute('popover', 'manual');
+        host.style.cssText = 'all:unset;display:block;position:fixed;inset:0;width:100vw;height:100vh;' +
+          'pointer-events:none;background:transparent;overflow:visible;z-index:2147483647;';
+      }
+      if (host.matches(':popover-open')) host.hidePopover();
+      host.showPopover();
+    } catch {}
   }
 
   async function onOverlayClick() {
@@ -587,7 +628,8 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     if (kind === 'airplay') pickAirPlay();
     if (kind === 'fullscreen') {
       try {
-        await document.documentElement.requestFullscreen();
+        // With a top-layer fill, fullscreen the filled element itself.
+        await (fillEl && site().fill === 'popover' ? fillEl : document.documentElement).requestFullscreen();
         needFullscreen = false;
       } catch (e) {
         event('fullscreen-click-failed', { name: e.name, message: e.message });
@@ -619,6 +661,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     if (!video) return { ...R, error: 'no video element' };
 
     // Captions
+    const ccButton = () => site().captions?.button?.();
     const btn = ccButton();
     if (!btn || getComputedStyle(btn).display === 'none') {
       R.results.push({ test: 'captions', note: 'this video has no captions; rerun on a captioned video' });

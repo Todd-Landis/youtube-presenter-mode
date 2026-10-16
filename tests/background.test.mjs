@@ -55,7 +55,7 @@ const tvScreen = { sw: 1920, sh: 1080, al: 1800, at: 0, aw: 1920, ah: 1080, iw: 
 assert.equal((await call({ type: 'hello' }, 2)).role, null);
 
 // start
-const r = await call({ type: 'start', videoId: 'abc', t: 42.5, screen: ctrlScreen }, 2);
+const r = await call({ type: 'start', site: 'youtube', key: 'abc', url: 'https://www.youtube.com/watch?v=abc&t=42s', t: 42.5, screen: ctrlScreen }, 2);
 assert.equal(r.ok, true, JSON.stringify(r));
 const s = r.session;
 assert.equal(s.controllerTabId, 2);
@@ -65,8 +65,8 @@ assert.equal((await call({ type: 'hello' }, 2)).role, 'controller');
 assert.equal((await call({ type: 'hello' }, s.playerTabId)).role, 'player');
 
 // player state from the TV screen → bounds remembered + window fullscreen attempted
-tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc' } : { ok: true, echo: msg });
-const st = (t, extra = {}) => ({ seq: 1, sentAt: Date.now(), t, d: 600, paused: false, rate: 1, videoId: 'abc', screen: tvScreen, vis: 'visible', focus: false, ...extra });
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, key: 'abc' } : { ok: true, echo: msg });
+const st = (t, extra = {}) => ({ seq: 1, sentAt: Date.now(), t, d: 600, paused: false, rate: 1, key: 'abc', screen: tvScreen, vis: 'visible', focus: false, ...extra });
 assert.equal((await call({ type: 'state', state: st(43) }, s.playerTabId)).ok, true);
 assert.ok(mem.local.tvBounds, 'TV bounds remembered');
 assert.ok(sent.some((m) => m.id === 2 && m.msg.type === 'state'), 'state relayed to controller');
@@ -90,17 +90,17 @@ assert.equal(inBg('S.fsAutoAttempts'), 3, 'no attempts beyond the limit');
 
 // Remote fullscreen button: the player says which way to go.
 const filled = { ...tvScreen, iw: 1920, ih: 1080 };
-tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc', screen: tvScreen } : { ok: true, echo: msg });
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, key: 'abc', screen: tvScreen } : { ok: true, echo: msg });
 const exitRes = await call({ type: 'toggleWindowFullscreen', exit: true }, s.playerTabId);
 assert.equal(windows.get(s.playerWindowId).state, 'normal');
 assert.equal(exitRes.ok, true, 'left fullscreen');
 sent.length = 0;
-tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc', screen: filled } : { ok: true, echo: msg });
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, key: 'abc', screen: filled } : { ok: true, echo: msg });
 const enterRes = await call({ type: 'toggleWindowFullscreen', exit: false }, s.playerTabId);
 assert.equal(windows.get(s.playerWindowId).state, 'fullscreen');
 assert.equal(enterRes.ok, true, 'entered fullscreen');
 assert.ok(!sent.some((m) => m.msg.type === 'needFullscreenClick'), 'no click needed when it worked');
-tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, videoId: 'abc' } : { ok: true, echo: msg });
+tabHandlers[s.playerTabId] = (msg) => (msg.type === 'getState' ? { t: 99, key: 'abc' } : { ok: true, echo: msg });
 
 // Bridge injection reports a missing scripting API instead of throwing.
 assert.equal((await call({ type: 'injectBridge' }, s.playerTabId)).ok, false);
@@ -131,8 +131,8 @@ assert.equal(dc.queued, 2);
 assert.equal(dc.expired, 1);
 assert.equal(dc.failures.at(-1).error, 'Could not establish connection');
 tabHandlers[s.playerTabId] = realHandler;
-await call({ type: 'cmd', action: 'load', value: { videoId: 'xyz', t: 0 } }, 2);
-assert.equal((await call({ type: 'hello' }, s.playerTabId)).session.videoId, 'xyz');
+await call({ type: 'cmd', action: 'load', value: { key: 'xyz', url: 'https://www.youtube.com/watch?v=xyz', t: 0 } }, 2);
+assert.equal((await call({ type: 'hello' }, s.playerTabId)).session.key, 'xyz');
 
 // diagnostics
 const d = await call({ type: 'diag:get' });
@@ -148,7 +148,7 @@ assert.equal((await call({ type: 'hello' }, 2)).role, null);
 
 // restart uses remembered bounds, and a window Safari put elsewhere is moved back
 misplaceNextWindow = true;
-const r2 = await call({ type: 'start', videoId: 'abc', t: 0, screen: ctrlScreen }, 2);
+const r2 = await call({ type: 'start', site: 'youtube', key: 'abc', url: 'https://www.youtube.com/watch?v=abc', t: 0, screen: ctrlScreen }, 2);
 assert.equal(r2.session.ctrlScreen.sw, 1800);
 assert.equal(windows.get(r2.session.playerWindowId).left, 0);
 await sleep(1700);

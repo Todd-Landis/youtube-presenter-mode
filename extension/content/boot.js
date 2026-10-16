@@ -1,12 +1,12 @@
-// Entry point: decide whether this tab is the player, the controller, or idle.
+// Entry point: pick the site adapter, then decide whether this tab is the
+// player, the controller, or idle.
 'use strict';
 (() => {
-  const hinted = location.hash.includes(YTPM.PLAYER_HASH);
+  YTPM.site = YTPM.pickSite();
   let role = null;
 
-  // Keyboard/media guards must be in place before YouTube's own scripts run.
+  // Keyboard/media guards must be in place before the site's own scripts run.
   // They stay inert until this tab becomes a controller.
-  if (hinted) YTPM.Player.prepare();
   YTPM.Controller.installGuards();
 
   YTPM.ext.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -23,24 +23,34 @@
     return true;
   });
 
+  // Is a session running or starting? Read from storage so idle pages on
+  // every site don't wake the background.
+  async function sessionLikely() {
+    try {
+      const { presence } = await YTPM.ext.storage.local.get('presence');
+      return !!presence && (presence.active || Date.now() - (presence.starting || 0) < 15000);
+    } catch {
+      return true;
+    }
+  }
+
   (async () => {
-    // The page-world bridge can take a few seconds to load (or never load in
-    // Safari); the player starts without it and upgrades when it arrives.
-    const bridgeReady = YTPM.initBridge();
-    let hello = await YTPM.send({ type: 'hello' });
-    // Retry if the message was lost, and in a player window, which can load
-    // before the background has recorded its tab id.
-    for (let i = 0; (hello == null || (hinted && hello.role !== 'player')) && i < 10; i++) {
+    let hello = (await sessionLikely()) ? await YTPM.send({ type: 'hello' }) : { role: null };
+    // Retry if the message was lost, or while a session is starting: a new
+    // player window can load before the background has recorded its tab id.
+    for (let i = 0; (hello == null || hello.wait) && i < 12; i++) {
       await YTPM.sleep(300);
       hello = await YTPM.send({ type: 'hello' });
     }
     role = hello?.role ?? 'none';
     if (role === 'player') {
       YTPM.Controller.setEnabled(false);
+      YTPM.Player.prepare();
       YTPM.Player.start(hello);
-      bridgeReady.then(() => YTPM.Player.onBridge());
+      // The page-world bridge can take a few seconds to load (or never load in
+      // Safari); the player starts without it and upgrades when it arrives.
+      if (YTPM.site.usesBridge) YTPM.initBridge().then(() => YTPM.Player.onBridge());
     } else {
-      if (hinted) YTPM.Player.unprepare();
       YTPM.Controller.init(hello);
     }
   })();

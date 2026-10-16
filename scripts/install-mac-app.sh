@@ -32,8 +32,19 @@ if [ -z "${TEAM_ID:-}" ]; then
 fi
 BUNDLE_ID="${BUNDLE_ID:-local.$(id -un).youtube-presenter-mode}"
 
-# The generated project references extension/ in place, so every build
-# picks up the current files.
+# The generated project references extension/ in place, so every build picks
+# up edited files. Folders (content/, icons/) are referenced whole, but the
+# top-level entries are listed one by one, so regenerate when one is added.
+if [ -d "$OUT" ]; then
+  PBX=$(find "$OUT" -maxdepth 3 -name project.pbxproj | head -1)
+  for entry in $(ls extension); do
+    if ! grep -q "extension/$entry[\";]" "$PBX"; then
+      echo "New extension entry ($entry); regenerating the Xcode project"
+      rm -rf "$OUT"
+      break
+    fi
+  done
+fi
 if [ ! -d "$OUT" ]; then
   xcrun safari-web-extension-converter extension \
     --project-location "$OUT" \

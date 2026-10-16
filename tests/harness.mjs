@@ -13,7 +13,8 @@ const read = (f) => fs.readFileSync(ROOT + f, 'utf8');
 const SRC = {
   background: read('background.js'),
   bridge: read('content/page-bridge.js'),
-  content: ['content/common.js', 'content/player.js', 'content/controller.js', 'content/boot.js'].map(read).join('\n'),
+  content: ['content/common.js', 'content/sites/youtube.js', 'content/sites/twitch.js', 'content/sites/generic.js',
+    'content/player.js', 'content/controller.js', 'content/boot.js'].map(read).join('\n'),
 };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -37,6 +38,8 @@ export const SCREENS = {
   tv: { x: 1800, y: 0, w: 1920, h: 1080, menu: 25 },
 };
 
+// Content by key: YouTube video IDs, Twitch "live:/vod:/clip:" keys, and
+// "gen:<path>" for pages on any other site.
 export const CATALOG = {
   vidAlpha001: { title: 'Alpha', d: 300 },
   vidBravo002: { title: 'Bravo', d: 200 },
@@ -44,13 +47,45 @@ export const CATALOG = {
   vidShort004: { title: 'Short one', d: 30 },
   vidLiveS005: { title: 'Live stream', live: true },
   vidError006: { title: '', error: 'auth' },
+  'live:streamerone': { title: 'streamerone', live: true },
+  'live:streamertwo': { title: 'streamertwo', live: true },
+  'live:maturechan': { title: 'maturechan', live: true, gate: true },
+  'vod:111': { title: 'Past broadcast', d: 3600 },
+  'clip:FunnyClip': { title: 'Funny clip', d: 30 },
+  'gen:/films/one': { title: 'Film one', d: 240 },
+  'gen:/films/two': { title: 'Film two', d: 180 },
+  'gen:/live': { title: 'Live cam', live: true },
+  'gen:/no-video': { title: 'Just text', none: true },
+  hero: { title: '', d: 1e9, muted: true },
 };
 const NEXT = { vidAlpha001: 'vidBravo002', vidBravo002: 'vidCharl003', vidCharl003: 'vidAlpha001' };
 
-function videoIdOf(url) {
+export function siteOf(url) {
+  const host = new URL(url).hostname;
+  return /youtube\.com$/.test(host) ? 'youtube' : /twitch\.tv$/.test(host) ? 'twitch' : 'generic';
+}
+
+function contentKey(url) {
   const u = new URL(url);
-  const m = u.pathname.match(/^\/(?:shorts|live)\/([\w-]+)/);
-  return m ? m[1] : u.searchParams.get('v');
+  const site = siteOf(url);
+  if (site === 'youtube') {
+    const m = u.pathname.match(/^\/(?:shorts|live)\/([\w-]+)/);
+    return m ? m[1] : u.searchParams.get('v');
+  }
+  if (site === 'twitch') {
+    const p = u.pathname.split('/').filter(Boolean);
+    if (p[0] === 'videos') return 'vod:' + p[1];
+    if (p[1] === 'clip') return 'clip:' + p[2];
+    return 'live:' + (p[0] || '').toLowerCase();
+  }
+  return 'gen:' + u.pathname;
+}
+
+function parseT(v) {
+  if (!v) return 0;
+  if (/^\d+$/.test(v)) return Number(v);
+  const m = v.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  return m ? (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0) : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,8 +124,10 @@ export class World {
     this.bgGen = 0;
     this.tvConnected = true;
     // jsdom keeps running a page's pending code after it closes (a real
-    // browser stops it), so errors from closed pages are not counted.
-    this.closedPages = new Set();
+    // browser stops it), so errors from closed pages are not counted. Page
+    // names are unique per process, and a previous test's closed pages can
+    // still be winding down, so the set is shared by every World.
+    this.closedPages = CLOSED_PAGES;
     this.onUnhandled = (e) => {
       const stack = String(e?.stack || e);
       if ([...this.closedPages].some((n) => stack.includes(n + '.js'))) return;
@@ -102,6 +139,7 @@ export class World {
 
   async dispose() {
     for (const t of this.tabs.values()) t.page?.close();
+    this.bgListeners = { onMessage: [() => true], onRemoved: [], onUpdated: [], onCommand: [] };
     this.bgGen++;
     await sleep(20);
     process.off('unhandledRejection', this.onUnhandled);
@@ -127,6 +165,7 @@ export class World {
   async deliverToBg(tab, msg) {
     await this.hop();
     if (this.rand() < this.o.dropToBg) throw new Error(NO_CONNECTION);
+    (this.bgLog ||= []).push({ type: msg.type, tab: tab.id });
     const listener = this.bgListeners.onMessage[0];
     const res = await new Promise((resolve) => {
       const keep = listener(clone(msg), { tab: this.tabInfo(tab) }, (r) => resolve(clone(r)));
@@ -254,15 +293,25 @@ export class World {
     return t;
   }
 
-  // The user's own YouTube tab on the Mac.
-  async openController(videoId = 'vidAlpha001') {
+  // The user's own tab on the Mac: a YouTube video ID or any URL.
+  async openController(target = 'vidAlpha001') {
+    const url = target.startsWith('http') ? target : 'https://www.youtube.com/watch?v=' + target;
     const win = this.newWindow({ left: 0, top: SCREENS.mac.menu, width: 1400, height: 900 });
-    const tab = this.newTab(win, 'https://www.youtube.com/watch?v=' + videoId);
+    const tab = this.newTab(win, url);
     this.activeTab = tab;
     this.focused = win.id;
     tab.page = new Page(this, tab, tab.url);
     await sleep(400);
     return tab.page;
+  }
+
+  // The toolbar popup's Start button, and the ⌥⇧P shortcut.
+  popupStart() {
+    return new Promise((resolve) => this.bgListeners.onMessage[0]({ type: 'popup:start' }, {}, resolve));
+  }
+
+  shortcut() {
+    this.fireBg('onCommand', 'toggle-presenter');
   }
 
   async createWindow(o) {
@@ -272,6 +321,7 @@ export class World {
     if (this.o.misplace) Object.assign(bounds, { left: 120, top: 120 });
     if (!this.tvConnected && bounds.left >= SCREENS.tv.x) Object.assign(bounds, { left: 140, top: 140 });
     const win = this.newWindow(bounds, o.type || 'normal');
+    win.byExtension = true;
     const tab = this.newTab(win, this.o.aboutBlank ? 'about:blank' : o.url);
     if (o.focused !== false) this.focused = win.id;
     if (this.o.aboutBlank) setTimeout(() => this.fireBg('onUpdated', tab.id, { url: 'about:blank', status: 'loading' }), 0);
@@ -360,7 +410,12 @@ export class World {
   }
 
   playerWindows() {
-    return [...this.windows.values()].filter((w) => w.tabs.some((id) => this.tabs.get(id)?.url?.includes('ytpm-player') || this.tabs.get(id)?.wasPlayer));
+    return [...this.windows.values()].filter((w) => w.byExtension);
+  }
+
+  // Messages that reached the background, by type (for "idle pages stay quiet").
+  bgMessages(type) {
+    return (this.bgLog || []).filter((m) => m.type === type);
   }
 
   playerPage() {
@@ -370,9 +425,11 @@ export class World {
 }
 
 // ---------------------------------------------------------------------------
-// A simulated YouTube page with the extension's content scripts injected.
+// Simulated pages (YouTube, Twitch, any other site) with the extension's
+// content scripts injected.
 
 let pageCount = 0;
+const CLOSED_PAGES = new Set();
 const PAGE_HTML = (title) => `<!doctype html><html><head><title>${title} - YouTube</title></head><body>
 <div id="masthead-container"><input id="search" type="text"></div>
 <div id="player-container"><div id="movie_player" class="html5-video-player">
@@ -386,13 +443,37 @@ const PAGE_HTML = (title) => `<!doctype html><html><head><title>${title} - YouTu
 <div id="comments"><div id="contenteditable-root" contenteditable="true"></div></div>
 </body></html>`;
 
+// Modelled on twitch.tv: the player sits under a transformed ancestor.
+const TWITCH_HTML = (title, gate) => `<!doctype html><html><head><title>${title} - Twitch</title></head><body>
+<nav class="top-nav"><input id="search" type="text"></nav>
+<main><div class="persistent-player" style="transform: translateZ(0)"><div class="aspect">
+<div data-a-target="video-player" class="video-player" style="position:absolute">
+<div class="layout"><div data-a-target="video-ref" class="video-ref"><video></video></div></div>
+<div data-a-target="player-overlay-click-handler" class="click-handler"></div>
+${gate ? '<div class="content-gate"><button data-a-target="player-overlay-mature-accept">Start Watching</button></div>' : ''}
+<div data-a-target="player-controls"><button data-a-target="player-play-pause-button" data-a-player-state="paused" aria-label="Play (space/k)"></button>
+<div class="player-controls__right-control-group"><div><button data-a-target="player-settings-button"></button></div>
+<div><button data-a-target="player-fullscreen-button" aria-label="Fullscreen (f)"></button></div></div></div>
+</div></div></div></main>
+<section class="chat"><div data-a-target="chat-input" contenteditable="true" role="textbox"></div></section>
+</body></html>`;
+
+// Any other site: a muted looping hero video as a decoy, and the real player
+// nested under a transformed container.
+const GENERIC_HTML = (title, none) => `<!doctype html><html><head><title>${title} | Example</title>
+<meta property="og:title" content="${title}"></head><body>
+<header><video class="hero" loop></video><input id="search" type="text"></header>
+<div class="page" style="transform: translateZ(0)"><div class="player-shell" style="position:relative;z-index:1">
+${none ? '<p>No video here.</p>' : '<div class="wrap"><video class="main"></video></div><div class="custom-controls"></div>'}
+</div></div>
+<textarea id="comment"></textarea>
+</body></html>`;
+
 class Page {
   constructor(world, tab, url) {
     this.world = world;
     this.tab = tab;
     this.url = url;
-    this.isPlayerUrl = url.includes('ytpm-player');
-    if (this.isPlayerUrl) tab.wasPlayer = true;
     this.loadedAt = Date.now();
     this.listener = null;
     this.gestureUntil = 0;
@@ -406,9 +487,12 @@ class Page {
       if (this.closed || /Not implemented/.test(e.message)) return;
       world.errors.push(`page ${tab.id}: ${e.message} ${e.detail?.stack || ''}`);
     });
-    const id = videoIdOf(url);
+    const id = contentKey(url);
     const meta = CATALOG[id] || { title: 'Unknown', d: 100 };
-    this.dom = new JSDOM(PAGE_HTML(meta.title), { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: vc });
+    this.site = siteOf(url);
+    const html = this.site === 'youtube' ? PAGE_HTML(meta.title)
+      : this.site === 'twitch' ? TWITCH_HTML(meta.title, meta.gate) : GENERIC_HTML(meta.title, meta.none);
+    this.dom = new JSDOM(html, { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: vc });
     const w = (this.win = this.dom.window);
     this.doc = w.document;
     Object.defineProperty(w.HTMLElement.prototype, 'isContentEditable', {
@@ -416,8 +500,16 @@ class Page {
     });
     this.installScreen();
     this.installFullscreenApi();
-    this.yt = this.installYouTube(this.doc.getElementById('movie_player'), { id, autoplay: true });
-    if (url.includes('/shorts/')) this.addShortsPlayer(id);
+    if (this.site === 'youtube') {
+      this.yt = this.installPlayer(this.doc.getElementById('movie_player'), { id, autoplay: true, api: true });
+      if (url.includes('/shorts/')) this.addShortsPlayer(id);
+    } else if (this.site === 'twitch') {
+      this.yt = this.installPlayer(this.doc.querySelector('[data-a-target="video-player"]'), { id, autoplay: true });
+    } else {
+      this.hero = this.installPlayer(this.doc.querySelector('header'), { id: 'hero', autoplay: true });
+      const main = this.doc.querySelector('.player-shell video');
+      if (main) this.yt = this.installPlayer(this.doc.querySelector('.player-shell'), { id, autoplay: false, videoEl: main });
+    }
 
     w.browser = {
       runtime: {
@@ -425,9 +517,11 @@ class Page {
         onMessage: { addListener: (f) => { this.listener = f; } },
         getURL: (p) => 'safari-web-extension://ytpm/' + p,
       },
+      storage: { local: { get: async (k) => ({ [k]: clone(world.storage.local[k]) }) } },
     };
     this.vmContext = this.dom.getInternalVMContext();
-    if (world.o.bridge) this.loadBridge();
+    // The page bridge is only registered for YouTube.
+    if (world.o.bridge && this.site === 'youtube') this.loadBridge();
     vm.runInContext(SRC.content, this.vmContext, { filename: this.name + '.js' });
     // Full navigations from the content scripts go through the simulated browser.
     if (w.YTPM) w.YTPM.navigate = (u) => world.navigateTab(tab.id, u);
@@ -503,12 +597,13 @@ class Page {
     el.click();
   }
 
-  // ---- a fake YouTube player (video element + #movie_player API) ----
-  installYouTube(container, { id, autoplay }) {
+  // ---- a fake player: a simulated <video>, plus YouTube's #movie_player API
+  // (api) or Twitch-style controls ----
+  installPlayer(container, { id, autoplay, api = false, videoEl = null }) {
     const page = this;
     const w = this.win;
-    const v = container.querySelector('video');
-    const s = { id, paused: true, ended: false, t: 0, rate: 1, volume: 1, muted: false, cc: false, ccAvail: true, since: Date.now() };
+    const v = videoEl || container.querySelector('video');
+    const s = { id, paused: true, ended: false, t: 0, rate: 1, volume: 1, muted: !!CATALOG[id]?.muted, cc: false, ccAvail: true, since: Date.now() };
     const meta = () => CATALOG[s.id] || { title: 'Unknown', d: 100 };
     const ev = (type) => v.dispatchEvent(new w.Event(type));
     const now = () => {
@@ -523,6 +618,7 @@ class Page {
         b.setAttribute('data-title-no-tooltip', s.paused ? 'Play' : 'Pause');
         b.setAttribute('aria-label', s.paused ? 'Play (k)' : 'Pause (k)');
       }
+      container.querySelector('[data-a-target="player-play-pause-button"]')?.setAttribute('data-a-player-state', s.paused ? 'paused' : 'playing');
     };
     const def = (k, get, set) => Object.defineProperty(v, k, { configurable: true, get, set });
     def('paused', () => s.paused);
@@ -533,10 +629,11 @@ class Page {
     def('volume', () => s.volume, (x) => { s.volume = x; ev('volumechange'); });
     def('muted', () => s.muted, (m) => { s.muted = m; ev('volumechange'); });
     def('readyState', () => (meta().error ? 0 : 4));
-    def('currentSrc', () => 'blob:https://www.youtube.com/' + s.id);
+    def('currentSrc', () => 'blob:https://example/' + s.id);
     v.getVideoPlaybackQuality = () => ({ droppedVideoFrames: 0, totalVideoFrames: Math.floor(now() * 30) });
     v.play = async () => {
       if (meta().error) throw new w.DOMException('No source', 'NotSupportedError');
+      if (meta().gate && !page.gateAccepted) return; // Twitch holds playback behind the gate
       const allowed = s.muted || page.world.o.autoplay || page.unlocked || Date.now() < page.gestureUntil;
       if (!allowed) throw new w.DOMException('play() requires a user gesture', 'NotAllowedError');
       if (Date.now() < page.gestureUntil) page.unlocked = true;
@@ -563,7 +660,7 @@ class Page {
         setBtn();
         ev('pause');
         ev('ended');
-        if (container.id === 'movie_player' && page.autoplayNext && NEXT[s.id]) setTimeout(() => page.spaNavigate('/watch?v=' + NEXT[s.id]), 200);
+        if (api && page.autoplayNext && NEXT[s.id]) setTimeout(() => page.spaNavigate('/watch?v=' + NEXT[s.id]), 200);
       }
       if (!s.paused) ev('timeupdate');
     });
@@ -576,7 +673,7 @@ class Page {
       if (play) v.play().catch(() => {});
     };
     // Main-world player API (YouTube's #movie_player methods).
-    Object.assign(container, {
+    if (api) Object.assign(container, {
       getPlayerState: () => (meta().error ? -1 : s.ended ? 0 : s.paused ? 2 : 1),
       playVideo: () => { v.play().catch(() => {}); },
       pauseVideo: () => v.pause(),
@@ -600,12 +697,19 @@ class Page {
     });
     const ccBtn = container.querySelector('.ytp-subtitles-button');
     ccBtn?.addEventListener('click', () => container.toggleSubtitles());
-    container.querySelector('.ytp-play-button')?.addEventListener('click', () => (s.paused ? container.playVideo() : container.pauseVideo()));
-    // YouTube autoplays on load.
+    const toggle = () => (s.paused ? v.play().catch(() => {}) : v.pause());
+    container.querySelector('.ytp-play-button')?.addEventListener('click', toggle);
+    container.querySelector('[data-a-target="player-play-pause-button"]')?.addEventListener('click', toggle);
+    container.querySelector('[data-a-target="player-overlay-mature-accept"]')?.addEventListener('click', (e) => {
+      page.gateAccepted = true;
+      e.target.closest('.content-gate')?.remove();
+      v.play().catch(() => {});
+    });
+    // YouTube and Twitch autoplay on load.
     setTimeout(() => {
       if (page.closed) return;
       const want = new URL(page.win.location.href).searchParams.get('t');
-      if (want) s.t = parseInt(want, 10) || 0;
+      if (want && !meta().live) s.t = parseT(want);
       ev('loadedmetadata');
       if (autoplay) v.play().catch(() => {});
     }, 30);
@@ -618,15 +722,22 @@ class Page {
     host.className = 'html5-video-player';
     host.innerHTML = '<div class="html5-video-container"><video class="video-stream html5-main-video"></video></div>';
     this.doc.body.append(host);
-    this.shorts = this.installYouTube(host, { id, autoplay: true });
+    this.shorts = this.installPlayer(host, { id, autoplay: true, api: true });
   }
 
-  // YouTube's in-page (SPA) navigation.
+  // In-page (SPA) navigation. YouTube announces it with yt-navigate-finish;
+  // Twitch just changes the URL and the stream.
   spaNavigate(path) {
     if (this.closed) return;
     this.win.history.pushState({}, '', path);
     const url = this.win.location.href;
-    const id = videoIdOf(url);
+    const id = contentKey(url);
+    if (this.site === 'twitch') {
+      this.doc.title = (CATALOG[id]?.title ?? 'Unknown') + ' - Twitch';
+      this.yt.load(id, 0);
+      return;
+    }
+    if (this.site !== 'youtube') return;
     if (path.startsWith('/shorts/')) {
       if (!this.shorts) this.addShortsPlayer(id);
       else this.shorts.load(id);

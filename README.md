@@ -1,16 +1,19 @@
-# YouTube Presenter Mode
+# Presenter Mode
 
-A Safari extension that turns a YouTube tab into a two-screen setup. The video
+A Safari extension that turns a video tab into a two-screen setup. The video
 plays fullscreen on your Apple TV, and the original tab on your Mac becomes a
 remote control. Use other apps freely; playback stays on the TV.
 
+It works with **YouTube**, **Twitch**, and **any other site** that plays its
+video in a standard `<video>` element.
+
 Playback stays in Safari on the Mac, so the browser-side ad blocking you
-already use keeps working. The Apple TV YouTube app doesn't get that.
+already use keeps working. The Apple TV apps don't get that.
 
 ## How it works
 
 Starting presenter mode opens a second window, the **player**, at the current
-timestamp. The original tab becomes the **controller**: its video pauses and
+position. The original tab becomes the **controller**: its video pauses and
 mutes, and a remote bar appears along the bottom.
 
 There are two ways to get the picture to the TV. Choose one in the toolbar
@@ -21,6 +24,19 @@ popup:
 | **Extended display** (default) | The player window goes fullscreen on the Apple TV, used as an AirPlay "Separate Display". |
 | **AirPlay video** (experimental) | The player window stays on the Mac and AirPlays its video to the Apple TV. No extra desktop. |
 
+### Sites
+
+| | YouTube | Twitch | Any other site |
+|---|---|---|---|
+| Start from | Button in the player controls, ⌥⇧P, toolbar | Button in the player controls, ⌥⇧P, toolbar | ⌥⇧P or toolbar |
+| What plays on the TV | Watch pages, Shorts, live links | Live channels, past broadcasts, clips | The page's main video (the largest; muted background loops are ignored) |
+| Picking another video on the Mac | Plays it on the TV | Plays it on the TV | Start again on the new page |
+| Captions | Yes | When the stream has them | When the site uses standard caption tracks |
+| Prompts dismissed on the TV | "Continue watching?" | Mature-content gate | — |
+
+On every site: play/pause, seeking, volume and mute. Speed too, except on live
+streams.
+
 ## Install
 
 Requires macOS with Safari 26 or later.
@@ -29,17 +45,18 @@ Requires macOS with Safari 26 or later.
 2. Safari ▸ Settings ▸ **Developer**: turn on **Allow unsigned extensions**.
 3. In the same tab, click **Add Temporary Extension…** and choose the
    `extension` folder.
-4. Safari ▸ Settings ▸ **Extensions**: enable **YouTube Presenter Mode**, then
-   set youtube.com to **Allow**.
-5. Reload any YouTube tabs that were already open.
+4. Safari ▸ Settings ▸ **Extensions**: enable **Presenter Mode**. Allow it on
+   the sites you want to use (or **on every website**). Safari also asks the
+   first time you use it on a new site.
+5. Reload any video tabs that were already open.
 
 Safari removes temporary extensions when it quits or after 24 hours. "Allow
 unsigned extensions" also resets when Safari quits. To pick up code changes,
 click **Reload** next to the extension in Settings ▸ Extensions.
 
-Recommended: Safari ▸ Settings ▸ **Websites** ▸ **Auto-Play** ▸ set youtube.com
-to **Allow All Auto-Play**. Without it, a new player window may need one click
-before it plays with sound.
+Recommended: Safari ▸ Settings ▸ **Websites** ▸ **Auto-Play** ▸ set the video
+sites you use to **Allow All Auto-Play**. Without it, a new player window may
+need one click before it plays with sound.
 
 ### Permanent install
 
@@ -61,7 +78,7 @@ build it into a small Mac app:
    and signs the app, copies it to `~/Applications`, and opens it once so
    Safari registers the extension.
 4. In Safari ▸ Settings ▸ Extensions, remove any temporary copy and enable
-   **YouTube Presenter Mode**.
+   **Presenter Mode**.
 
 Run `npm run install:mac` again after changing the code.
 
@@ -81,16 +98,15 @@ fullscreen and remembers that spot for next time.
 
 ## Usage
 
-**Start** in any of three ways:
-- the presenter button in YouTube's player controls (next to fullscreen)
-- **⌥⇧P**
-- the toolbar popup
+**Start** with the presenter button in YouTube's or Twitch's player controls
+(next to fullscreen), **⌥⇧P**, or the toolbar popup.
 
 **Remote bar:** title, play/pause, ±10 s, scrubber, speed, captions,
-mute/volume, TV fullscreen, collapse and **End**.
+mute/volume, TV fullscreen, collapse and **End**. Live streams show LIVE
+instead of a scrubber.
 
 **Keyboard:** the usual YouTube shortcuts act on the TV while the controller
-tab has focus:
+tab has focus, on any site:
 
 | Key | Action |
 |---|---|
@@ -103,22 +119,23 @@ tab has focus:
 | F | Fullscreen on the TV |
 | < / > | Speed |
 | 0–9 | Jump to 0–90% |
-| Shift+N | Next video |
+| Shift+N | Next video (YouTube) |
 
-These keys are ignored while you type in the search box or a comment field.
+These keys are ignored while you type in a search box, a comment field or chat.
 
 **Other behaviour:**
-- Clicking another video, a Short or a live link in the controller plays it
-  on the TV. Timestamp and chapter links in the description or comments move
-  the TV too.
+- **YouTube:** clicking another video, a Short or a live link in the
+  controller plays it on the TV. Timestamp and chapter links in the
+  description or comments move the TV too.
+- **Twitch:** switching channel, or opening a past broadcast or clip, in the
+  controller does the same. Chat stays usable on the Mac.
+- **Any site:** seeking with the site's own player on the Mac moves the TV.
 - If the TV display disconnects (the Apple TV sleeps, AirPlay drops), playback
   pauses instead of taking over the Mac screen.
 - **End** closes the player and leaves the Mac tab paused at the TV's
   position.
 - Closing the player window also ends presenter mode.
-- Closing the controller tab leaves the player as a normal YouTube window.
-- The player dismisses YouTube's "Continue watching?" prompt, so long videos
-  and playlists don't pause on the TV.
+- Closing the controller tab leaves the player as a normal page.
 
 ## Diagnostics
 
@@ -130,9 +147,10 @@ look when something misbehaves. It covers:
 - **Background playback and sync:** gaps in player-to-controller updates,
   playback stalls, dropped frames and visibility changes. Each is timestamped,
   so you can line them up with what you were doing.
+- **Command delivery:** how remote-bar commands reached the player, with
+  Safari's error for any that needed a fallback.
 - **Control paths:** a self-test that toggles captions, speed and play/pause
-  three ways (player API, YouTube's buttons, synthetic keys) and records which
-  ones work.
+  three ways and records which ones work.
 - **AirPlay route:** every connect and disconnect in AirPlay mode, with the
   context at the time.
 
@@ -149,43 +167,63 @@ npm test
 ```
 
 `npm test` runs the quick unit tests. `npm run test:system` runs the
-end-to-end scenarios against simulated Safari and YouTube, including dropped
-messages, background restarts, reloads and fullscreen failures; see
-[TESTING.md](TESTING.md). `npm run check` syntax-checks every script.
-`npm run icons` redraws the icons.
+end-to-end scenarios (YouTube, Twitch and a generic site) against simulated
+Safari and pages, including dropped messages, background restarts, reloads and
+fullscreen failures; see [TESTING.md](TESTING.md). `npm run check`
+syntax-checks every script. `npm run icons` redraws the icons.
 
 ```
 extension/
-  manifest.json            Manifest V3
-  background.js            session, window placement/fullscreen, message relay, diagnostics
-  content/common.js        shared helpers, DOM builder, page-bridge client
-  content/page-bridge.js   runs in YouTube's page context; wraps #movie_player's API
-  content/player.js        player window: fill-screen CSS, state reports, commands, overlays, AirPlay
-  content/controller.js    controller tab: presenter button, remote bar, key forwarding
-  content/boot.js          assigns each YouTube tab its role
-  popup.*, diagnostics.*   toolbar popup and diagnostics page
+  manifest.json              Manifest V3
+  background.js              session, window placement/fullscreen, message relay, diagnostics
+  content/common.js          shared helpers, DOM builder, site registry, page-bridge client
+  content/sites/youtube.js   YouTube adapter
+  content/sites/twitch.js    Twitch adapter
+  content/sites/generic.js   any other site with a <video>
+  content/page-bridge.js     runs in YouTube's page context; wraps #movie_player's API
+  content/player.js          player window: filling the TV, state reports, commands, overlays, AirPlay
+  content/controller.js      controller tab: presenter button, remote bar, key forwarding
+  content/boot.js            picks the site adapter and the tab's role
+  popup.*, diagnostics.*     toolbar popup and diagnostics page
   icons/
 scripts/
-  install-mac-app.sh       builds, signs and installs the Mac app (permanent install)
-  make-icons.swift         icon generator
-tests/                     unit tests, system harness and scenarios (TESTING.md)
+  install-mac-app.sh         builds, signs and installs the Mac app (permanent install)
+  make-icons.swift           icon generator
+tests/                       unit tests, system harness and scenarios (TESTING.md)
 ```
+
+A site adapter says which URLs are playable and what the TV opens. It also
+says how to find the video and what to blow up on the TV, plus where the
+presenter button goes, how captions toggle, which prompts to dismiss, and how
+to switch videos. Adding a site means adding one file to `content/sites/` and
+listing it in the manifest.
+
+On the TV, YouTube's player is resized with CSS. Twitch and generic sites have
+their player lifted into the browser's top layer (the popover API), which
+escapes any transform or stacking on the page.
 
 YouTube enforces Trusted Types, so the content scripts build DOM nodes directly
 and never assign `innerHTML`.
 
 ## Limitations
 
-- These depend on YouTube's markup and can break when YouTube changes it:
-  `.ytp-right-controls-right`, `.ytp-subtitles-button`, `ytd-watch-metadata h1`
-  and the "Continue watching?" dialog.
+- Site markup changes can break the YouTube and Twitch adapters, for example
+  YouTube's `.ytp-right-controls-right` or Twitch's
+  `[data-a-target="video-player"]`.
+- Generic sites: the TV opens the same page address, so it suits pages where
+  the address identifies the video. In feeds (X, Reddit, Instagram) the TV may
+  land on a different video. Players that only create their `<video>` after
+  you click play need one click on the TV. Videos inside iframes aren't
+  picked up yet.
+- DRM services (Netflix, Disney+, Prime Video) will likely show black on an
+  AirPlay display, or refuse a second stream.
 - Opening a playlist link from the controller reloads the player page.
   Window fullscreen survives the reload, but autoplay has to be allowed for
-  youtube.com.
+  the site.
 - If the player autoplays the next video, the controller page doesn't follow.
   The remote bar shows the new title.
-- AirPlay mode depends on Safari keeping YouTube's stream routed to the Apple
-  TV. Treat it as experimental.
+- AirPlay mode depends on Safari keeping the stream routed to the Apple TV.
+  Treat it as experimental.
 
 ## License
 

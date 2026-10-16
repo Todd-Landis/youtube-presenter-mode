@@ -6,7 +6,6 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
 (() => {
   const ext = globalThis.browser ?? globalThis.chrome;
   YTPM.ext = ext;
-  YTPM.PLAYER_HASH = 'ytpm-player';
 
   YTPM.debug = (...args) => console.debug('[YTPM]', ...args);
   YTPM.sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -80,30 +79,60 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
     return (h ? h + ':' : '') + mm + ':' + String(sec).padStart(2, '0');
   };
 
-  // Watch, Shorts and live URLs. `t` may be 90, 90s or 1h2m3s.
-  YTPM.parseWatch = (href) => {
+  // `t=` style times: 90, 90s, 1m30s or 1h2m3s.
+  YTPM.parseTime = (v) => {
+    if (!v) return 0;
+    if (/^\d+(\.\d+)?$/.test(v)) return Number(v);
+    const m = String(v).match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+    return m ? (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0) : 0;
+  };
+
+  YTPM.hms = (t) => {
+    t = Math.floor(t);
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+    return (h ? h + 'h' : '') + (h || m ? m + 'm' : '') + s + 's';
+  };
+
+  // A page's identity without its fragment.
+  YTPM.urlKey = (href) => {
     try {
       const u = new URL(href);
-      const q = u.searchParams;
-      const path = u.pathname.match(/^\/(?:shorts|live)\/([\w-]{6,})/);
-      const videoId = u.pathname === '/watch' ? q.get('v') : path ? path[1] : null;
-      if (!videoId) return { videoId: null };
-      return { videoId, list: q.get('list'), index: q.get('index'), t: parseTime(q.get('t') || q.get('start')) };
+      return u.origin + u.pathname + u.search;
     } catch {
-      return { videoId: null };
+      return href;
     }
   };
 
-  function parseTime(v) {
-    if (!v) return 0;
-    if (/^\d+(\.\d+)?$/.test(v)) return Number(v);
-    const m = v.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
-    return m ? (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0) : 0;
-  }
+  // ---- site adapters ---------------------------------------------------------
+  // Each file in content/sites/ registers one. The first whose matches() says
+  // yes handles the page; "generic" handles everything else.
+  YTPM.sites = [];
+  YTPM.registerSite = (site) => YTPM.sites.push(site);
+  YTPM.pickSite = (loc = location) =>
+    YTPM.sites.find((s) => s.id !== 'generic' && s.matches(new URL(loc.href))) ||
+    YTPM.sites.find((s) => s.id === 'generic');
 
-  YTPM.findVideo = () =>
-    document.querySelector('#movie_player video.html5-main-video') ||
-    document.querySelector('#movie_player video');
+  // The largest visible <video>, preferring one that is playing. Muted loops
+  // are background decoration (hero banners, GIF-style clips) and don't count.
+  YTPM.bestVideo = (root = document) => {
+    let best = null;
+    let bestScore = 0;
+    for (const v of root.querySelectorAll('video')) {
+      if (v.muted && v.loop) continue;
+      const r = v.getBoundingClientRect();
+      // Without layout (tests), fall back to the video's own size.
+      const area = r.width * r.height || v.videoWidth * v.videoHeight || 1;
+      if (r.width && r.height && (r.width < 160 || r.height < 90)) continue;
+      let score = area;
+      if (!v.paused) score *= 4;
+      if (Number.isFinite(v.duration) && v.duration > 0) score *= 1.5;
+      if (score > bestScore) {
+        best = v;
+        bestScore = score;
+      }
+    }
+    return best;
+  };
 
   // What this window can tell about the display it is on. Safari exposes the
   // non-standard availLeft/availTop, which identify the screen's origin.

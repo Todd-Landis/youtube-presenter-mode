@@ -5,13 +5,16 @@ Three layers, from fast to thorough:
 | Command | What it covers | Time |
 |---|---|---|
 | `npm test` | Unit tests: background logic against mocked extension APIs, content scripts in jsdom | ~10 s |
-| `npm run test:system` | 35 end-to-end scenarios plus a fuzzer, against simulated Safari and YouTube | ~4 min |
+| `npm run test:system` | 43 end-to-end scenarios plus a fuzzer, against simulated Safari, YouTube, Twitch and a generic site | ~5 min |
 | Manual checklist below | The things only real Safari and a real Apple TV can show | ~10 min |
 
 ## The system harness
 
 `tests/harness.mjs` runs the real `background.js` and content scripts together:
-- A simulated Mac YouTube tab and a simulated TV window, each a fake YouTube page with a working player. It has a playback clock, autoplay rules, SPA navigation, Shorts, and live and broken videos.
+- A simulated Mac tab and a simulated TV window, each a fake page with a working player (playback clock, autoplay rules, SPA navigation). There are three kinds:
+  - **YouTube**, with Shorts and live and broken videos
+  - **Twitch**, modelled on the real page: a transformed ancestor around the player, `data-a-target` controls, live channels, VODs, clips and a mature-content gate
+  - **a generic site**, with a muted looping hero video as a decoy and the real player nested under transformed containers
 - They're wired through a simulated Safari extension layer that can be made to misbehave:
   - drop or delay messages in either direction, or lose replies
   - unload the background page mid-session (in-memory state lost, storage kept)
@@ -98,6 +101,25 @@ Found by reading the code, by checking real YouTube behaviour in a browser, and 
 | Holding Space or K | Play/pause flickered on every key repeat | Only seek and volume keys repeat |
 | Typing with an input method (e.g. Japanese) | Composition keystrokes could control the TV | Ignored while composing |
 
+### More sites (YouTube, Twitch, any page with a video)
+
+The extension is split into a shared core and per-site adapters (`content/sites/`). Checked against the live sites first:
+- **Twitch:** one `<video>` (duration `Infinity` when live) inside `[data-a-target="video-player"]`. An ancestor has a CSS transform, so the usual `position: fixed` fill doesn't work. The player is lifted into the top layer instead, which filled the window on a live channel. Twitch's content-classification label and extension overlays also had to be hidden.
+- **Generic site:** the page's largest `<video>`, lifted into the top layer, filled the window and kept playing.
+
+Problems that came up while generalising, and what was done about them:
+
+| Problem | Fix |
+|---|---|
+| The TV window was found by a `#ytpm-player` marker in its URL; arbitrary sites can use the URL hash for their own routing | The background knows the TV's tab; while a start is in flight, unknown pages are told to ask again |
+| Content scripts now run on every site, and each page load would have woken the background | Idle pages read a "session active or starting" flag from storage first and stay quiet otherwise (scenario: idle pages stay quiet) |
+| Twitch changes channel without a page load or a YouTube-style event | The controller also polls the URL |
+| A page with only a muted background loop would present that | Muted loops are never picked |
+| Seeking a live stream to the Mac's position, or a generic page's pre-roll | No resume on live streams; on generic sites only when the video length matches |
+| Speed and percentage seeks on live streams | Ignored, and the speed menu is disabled |
+| The TV's own prompts would sit under a top-layer player | Prompts go in the top layer too, above it |
+| The controller was dropped when its tab left YouTube | Its content script runs everywhere now, so it stays the controller; only the TV leaving the session's site ends it |
+
 ## What the simulation can't prove
 
 The harness models Safari as closely as I could. Real Safari still decides these, so they need the manual check:
@@ -105,8 +127,10 @@ The harness models Safari as closely as I could. Real Safari still decides these
 - which bridge path loads in Safari (manifest, script tag or scripting API), or none. Diagnostics ▸ Control paths shows it
 - AirPlay route behaviour (not simulated)
 - YouTube's real markup, which can change. Checked against the live site: the play button's "Pause"/"Play" label, Shorts using `#shorts-player`, `loadVideoById` leaving the page URL unchanged, live durations, and error codes
+- Twitch's real behaviour beyond what was checked live (VOD `?t=` handling, captions on streams that have them, the mature-content gate's button)
+- generic sites vary endlessly: lazy players, iframes, players that re-create their video element
 
-One fuzz run reported an error that didn't reproduce in ten reruns of the same seeds. The error could only come from code running in a simulated page the harness had already closed.
+An occasional "script error" in earlier runs turned out to be the harness itself. A test's closed pages kept running briefly (jsdom doesn't stop them), and their errors were reported to the next test, which didn't know those pages were closed. The list of closed pages is now shared by every test.
 
 ## Manual checklist (real Safari, real TV)
 
@@ -123,5 +147,8 @@ After `npm run install:mac`, close any old TV window and reload YouTube tabs. Th
 9. Reload the Mac tab: the bar comes back and works.
 10. Put the Apple TV to sleep (or stop AirPlay) mid-video: playback pauses and the remote says so.
 11. Press End: the TV window closes; the Mac tab is parked at the TV's position. Nothing comes back.
+12. **Twitch:** on a live channel, start from the button next to Twitch's fullscreen button. The TV shows only the stream; the bar shows LIVE. Switch channel on the Mac: the TV follows and stays fullscreen. Type in chat: nothing reaches the TV.
+13. **Twitch VOD:** start partway into a past broadcast. The TV starts at the same point; J/L seek.
+14. **Any site:** on a page with a video (a news site or Vimeo, say), press ⌥⇧P. The TV opens the page with just that video filling the screen, from the Mac's position. Allow the extension on that site if Safari asks.
 
 If anything misbehaves: Toolbar ▸ Diagnostics ▸ **Copy report**.

@@ -6,7 +6,8 @@ import assert from 'node:assert/strict';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
 const root = fileURLToPath(new URL('../extension/', import.meta.url));
-const files = ['content/page-bridge.js', 'content/common.js', 'content/player.js', 'content/controller.js', 'content/boot.js'];
+const files = ['content/page-bridge.js', 'content/common.js', 'content/sites/youtube.js', 'content/sites/twitch.js',
+  'content/sites/generic.js', 'content/player.js', 'content/controller.js', 'content/boot.js'];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const HTML = `<!doctype html><html><head><title>Test Video - YouTube</title></head><body>
@@ -64,9 +65,9 @@ function setup(url, hello, onSend) {
 
 // ---------------- controller ----------------
 {
-  const session = { id: 's', mode: 'extended', videoId: 'abc', ctrlScreen: {} };
+  const session = { id: 's', mode: 'extended', key: 'abc', ctrlScreen: {} };
   const t = setup('https://www.youtube.com/watch?v=abc', { role: null, session: null, settings: {} },
-    (m) => (m.type === 'start' ? { ok: true, session } : m.type === 'end' ? { ok: true, final: { t: 123, videoId: 'abc' } } : null));
+    (m) => (m.type === 'start' ? { ok: true, session } : m.type === 'end' ? { ok: true, final: { t: 123, key: 'abc' } } : null));
   const { w, v, vs, sent, deliver } = t;
   const doc = w.document;
   let youtubeSawKey = 0;
@@ -79,7 +80,9 @@ function setup(url, hello, onSend) {
   btn.click();
   await sleep(50);
   const start = sent.find((m) => m.type === 'start');
-  assert.equal(start.videoId, 'abc');
+  assert.equal(start.key, 'abc');
+  assert.equal(start.site, 'youtube');
+  assert.match(start.url, /^https:\/\/www\.youtube\.com\/watch\?v=abc&t=42s$/);
   assert.equal(start.t, 42);
   assert.equal(vs.paused, true, 'local video paused');
   assert.equal(vs.muted, true, 'local video muted');
@@ -91,7 +94,7 @@ function setup(url, hello, onSend) {
   await v.play();
   assert.equal(vs.paused, true, 'play guard re-pauses');
 
-  await deliver({ type: 'state', state: { t: 61, d: 600, paused: false, rate: 1.5, vol: 80, muted: false, cc: true, ccAvail: true, title: 'On TV', videoId: 'abc', overlay: 'gesture' } });
+  await deliver({ type: 'state', state: { t: 61, d: 600, paused: false, rate: 1.5, vol: 80, muted: false, cc: true, ccAvail: true, title: 'On TV', key: 'abc', overlay: 'gesture', hasNext: true } });
   const sr = host.shadowRoot;
   assert.equal(sr.querySelector('.title').textContent, 'On TV');
   assert.match(sr.querySelector('.time').textContent, /^1:0\d \/ 10:00$/);
@@ -120,21 +123,21 @@ function setup(url, hello, onSend) {
 
   // Pause from the bar, then a report taken just before the click arrives:
   // it must not flip the bar back to "playing".
-  await deliver({ type: 'state', state: { t: 70, d: 600, paused: false, rate: 1, sentAt: Date.now(), title: 'On TV', videoId: 'abc' } });
+  await deliver({ type: 'state', state: { t: 70, d: 600, paused: false, rate: 1, sentAt: Date.now(), title: 'On TV', key: 'abc' } });
   const playBtn = sr.querySelector('.row button');
   playBtn.click();
   assert.deepEqual(cmds().at(-1), ['pause', undefined]);
-  await deliver({ type: 'state', state: { t: 70.4, d: 600, paused: false, rate: 1, sentAt: Date.now() - 200, title: 'On TV', videoId: 'abc' } });
+  await deliver({ type: 'state', state: { t: 70.4, d: 600, paused: false, rate: 1, sentAt: Date.now() - 200, title: 'On TV', key: 'abc' } });
   assert.equal(playBtn.getAttribute('title'), 'Play/pause (k)');
   assert.equal(playBtn.querySelector('path').getAttribute('d'), 'M8 5v14l11-7z', 'still shows the play icon (paused)');
   playBtn.click();
   assert.deepEqual(cmds().at(-1), ['play', undefined], 'second click plays, not a second pause');
-  await deliver({ type: 'state', state: { t: 71, d: 600, paused: false, rate: 1, sentAt: Date.now() + 1, title: 'On TV', videoId: 'abc' } });
+  await deliver({ type: 'state', state: { t: 71, d: 600, paused: false, rate: 1, sentAt: Date.now() + 1, title: 'On TV', key: 'abc' } });
 
   // SPA navigation to another video → loads on the TV
   w.history.pushState({}, '', '/watch?v=zzz');
   doc.dispatchEvent(new w.Event('yt-navigate-finish'));
-  assert.equal(JSON.stringify(cmds().at(-1)), JSON.stringify(['load', { videoId: 'zzz', list: null, index: null, t: 0 }]));
+  assert.equal(JSON.stringify(cmds().at(-1)), JSON.stringify(['load', { key: 'zzz', url: 'https://www.youtube.com/watch?v=zzz', t: 0, list: null, index: null }]));
   w.history.pushState({}, '', '/watch?v=abc');
   doc.dispatchEvent(new w.Event('yt-navigate-finish'));
 
@@ -154,9 +157,9 @@ function setup(url, hello, onSend) {
 
 // ---------------- player ----------------
 {
-  const session = { id: 's', mode: 'extended', videoId: 'abc', startT: 30, ctrlScreen: { sw: 1800, sh: 1169, al: null, at: null } };
+  const session = { id: 's', mode: 'extended', key: 'abc', startT: 30, ctrlScreen: { sw: 1800, sh: 1169, al: null, at: null } };
   let queued = [];
-  const t = setup('https://www.youtube.com/watch?v=abc&t=30s#ytpm-player', { role: 'player', session, settings: {} },
+  const t = setup('https://www.youtube.com/watch?v=abc&t=30s', { role: 'player', session, settings: {} },
     (m) => (m.type === 'state' ? { ok: true, cmds: queued.splice(0) } : null));
   const { w, vs, api, sent, deliver } = t;
   const doc = w.document;
@@ -205,7 +208,7 @@ function setup(url, hello, onSend) {
   w.document.getElementById('movie_player').pauseVideo = realPauseVideo;
   await cmd('togglePlay');
   assert.equal(vs.paused, false);
-  assert.equal(await cmd('load', { videoId: 'zzz', t: 0 }), 'api');
+  assert.equal(await cmd('load', { key: 'zzz', url: 'https://www.youtube.com/watch?v=zzz', t: 0 }), 'api');
 
   // Same command id twice (direct retry + queued copy) runs once.
   const before = api.calls.filter((c) => c[0] === 'seekTo').length;
@@ -230,7 +233,7 @@ function setup(url, hello, onSend) {
   assert.match(ov.shadowRoot.textContent, /Click to go fullscreen/);
 
   const st = await deliver({ type: 'getState' });
-  assert.equal(st.videoId, 'abc');
+  assert.equal(st.key, 'abc');
   const self = await deliver({ type: 'selftest' });
   assert.ok(self.results.length >= 5, 'self-test produced results');
   await deliver({ type: 'orphaned' });

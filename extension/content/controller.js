@@ -1,8 +1,10 @@
-// Controller role: the normal YouTube tab on the Mac. Its own video stays
-// paused and muted; the remote bar and YouTube's shortcuts drive the player.
+// Controller role: the original tab on the Mac. Its own video stays paused
+// and muted; the remote bar and the usual shortcuts drive the player. Site
+// specifics come from YTPM.site.
 'use strict';
 YTPM.Controller = (() => {
   const { h, icon, fmtTime } = YTPM;
+  const site = () => YTPM.site;
   const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
   let enabled = true;
@@ -17,6 +19,7 @@ YTPM.Controller = (() => {
   let startedHere = false; // this tab started the session (vs. picked it up after a reload)
   let enteredAt = 0;
   let lastNavAt = 0;
+  let lastHref = location.href;
   let lastLoad = { id: null, at: 0 };
   const endedSessions = new Set();
   let prevMuted = null;
@@ -46,7 +49,7 @@ YTPM.Controller = (() => {
   };
 
   // ---- keyboard forwarding -------------------------------------------------------
-  // Same keys YouTube uses; looked up by KeyboardEvent.key.
+  // YouTube's keys (Twitch uses the same few); looked up by KeyboardEvent.key.
   const KEYMAP = {
     ' ': ['togglePlay'], k: ['togglePlay'],
     j: ['seekBy', -10], l: ['seekBy', 10],
@@ -75,7 +78,7 @@ YTPM.Controller = (() => {
   }
 
   // Registered at document_start in the capture phase on window, so this runs
-  // before any of YouTube's own key handlers.
+  // before any of the site's own key handlers.
   function onKeyDown(e) {
     if (!active || e.isComposing || isEditable(e)) return;
     const m = mapKey(e);
@@ -95,9 +98,8 @@ YTPM.Controller = (() => {
 
   // ---- local video ----------------------------------------------------------------
 
-  const isMainVideo = (el) => el instanceof HTMLMediaElement && !!el.closest?.('#movie_player');
-  // The watch-page player and the Shorts player; both would play with sound.
-  const isYouTubePlayer = (el) => el instanceof HTMLMediaElement && !!el.closest?.('#movie_player, #shorts-player');
+  const isMainVideo = (el) => el instanceof HTMLMediaElement && !!site().isMainVideo(el);
+  const isPlayerVideo = (el) => el instanceof HTMLMediaElement && !!site().isPlayerVideo(el);
 
   function holdLocal(v) {
     if (!v.muted) v.muted = true;
@@ -105,7 +107,7 @@ YTPM.Controller = (() => {
   }
 
   function holdAllLocal() {
-    document.querySelectorAll('#movie_player video, #shorts-player video').forEach(holdLocal);
+    site().localVideos().forEach(holdLocal);
   }
 
   function installGuards() {
@@ -115,13 +117,19 @@ YTPM.Controller = (() => {
     // Media events don't bubble, but capture-phase listeners on document still see them.
     // While presenting, nothing on this page plays with sound.
     document.addEventListener('play', (e) => {
-      if (active && (isYouTubePlayer(e.target) || (e.target instanceof HTMLMediaElement && !e.target.muted))) holdLocal(e.target);
+      if (active && (isPlayerVideo(e.target) || (e.target instanceof HTMLMediaElement && !e.target.muted))) holdLocal(e.target);
     }, true);
     document.addEventListener('volumechange', (e) => {
-      if (active && isYouTubePlayer(e.target) && !e.target.muted) e.target.muted = true;
+      if (active && isPlayerVideo(e.target) && !e.target.muted) e.target.muted = true;
     }, true);
     document.addEventListener('seeked', onLocalSeek, true);
-    document.addEventListener('yt-navigate-finish', onNavigate);
+    // YouTube announces its in-page navigations; other sites are polled.
+    document.addEventListener('yt-navigate-finish', () => { lastHref = location.href; onNavigate(); });
+    setInterval(() => {
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      onNavigate();
+    }, 500);
     setInterval(() => {
       ensureButton();
       if (active) {
@@ -131,14 +139,14 @@ YTPM.Controller = (() => {
     }, 1000);
   }
 
-  // A timestamp or chapter link seeks YouTube's (paused) local player in
-  // place. Pass that on to the TV, but not the seeks YouTube makes by itself
-  // while a page loads.
+  // A timestamp or chapter link (or the site's own scrubber) seeks the paused
+  // local player in place. Pass that on to the TV, but not the seeks a site
+  // makes by itself while a page loads.
   function onLocalSeek(e) {
     if (!active || !isMainVideo(e.target)) return;
     if (Date.now() - Math.max(lastNavAt, enteredAt) < 1500) return;
-    const here = YTPM.parseWatch(location.href).videoId;
-    if (!here || here !== st?.videoId) return;
+    const here = site().parse(location.href)?.key;
+    if (!here || here !== st?.key || st?.live) return;
     if (Math.abs(e.target.currentTime - currentTime()) < 1.5) return;
     command('seekTo', e.target.currentTime);
   }
@@ -152,40 +160,35 @@ YTPM.Controller = (() => {
     if (hello?.role === 'controller' && hello.session) enter(hello.session);
   }
 
-  // ---- presenter button in YouTube's player controls -------------------------------
+  // ---- presenter button in the site's player controls ------------------------------
 
   function ensureButton() {
-    if (!enabled || location.pathname !== '/watch') return;
+    if (!enabled || !site().parse(location.href)) return;
     let btn = document.getElementById('ytpm-btn');
     if (!btn) {
-      const bar = document.querySelector('#movie_player .ytp-right-controls-right') ||
-        document.querySelector('#movie_player .ytp-right-controls');
-      if (!bar) return;
       btn = h('button', {
         id: 'ytpm-btn',
-        class: 'ytp-button',
         title: 'Presenter mode: play on TV (⌥⇧P)',
         'aria-label': 'Presenter mode',
-        style: 'display:inline-flex;align-items:center;justify-content:center;',
         onclick: (e) => {
           e.preventDefault();
           e.stopPropagation();
           toggle();
         },
       }, icon('present', 24));
-      bar.insertBefore(btn, bar.querySelector(':scope > .ytp-fullscreen-button'));
+      if (!site().insertButton(btn)) return;
     }
-    btn.style.color = active ? '#3ea6ff' : '';
+    btn.style.color = active ? '#3ea6ff' : '#fff';
   }
 
   // Covers the paused local player so clicks on it go to the TV instead.
   function attachShield() {
-    if (!active || location.pathname !== '/watch') return;
-    const mp = document.getElementById('movie_player');
-    if (!mp || mp.querySelector(':scope > #ytpm-shield')) return;
+    if (!active || site().parse(location.href)?.key !== session?.key) return;
+    const host = site().shieldHost();
+    if (!host || host.querySelector(':scope > #ytpm-shield')) return;
     const stop = (e) => e.stopPropagation();
     const airplay = session?.mode === 'airplay';
-    mp.append(h('div', {
+    host.append(h('div', {
       id: 'ytpm-shield',
       style: 'position:absolute;inset:0;z-index:1000;display:flex;flex-direction:column;align-items:center;' +
         'justify-content:center;gap:8px;background:rgba(0,0,0,.8);color:#fff;cursor:pointer;text-align:center;' +
@@ -196,7 +199,7 @@ YTPM.Controller = (() => {
     icon(airplay ? 'airplay' : 'tv', 56),
     h('div', {}, airplay ? 'Playing on Apple TV' : 'Playing on your TV'),
     h('div', { style: 'font-weight:400;font-size:13px;color:#bbb' },
-      'Click to play/pause. YouTube shortcuts control the TV.')));
+      'Click to play/pause. Keyboard shortcuts control the TV.')));
   }
 
   // ---- session ---------------------------------------------------------------------
@@ -209,17 +212,23 @@ YTPM.Controller = (() => {
 
   async function start() {
     if (starting) return; // double-click
-    const w = YTPM.parseWatch(location.href);
-    if (!w.videoId) return toast('Open a YouTube video first.');
-    const v = YTPM.findVideo();
+    const item = site().parse(location.href);
+    if (!item) return toast('Open a video first.');
+    const v = site().findVideo();
+    if (!v) return toast('No video found on this page.');
+    const live = !Number.isFinite(v.duration);
+    const t = live ? 0 : v.currentTime;
     starting = true;
     try {
       toast('Opening the player window…');
       // Safe to retry: the background returns the session it just started.
       const res = await YTPM.sendRetry({
         type: 'start',
-        videoId: w.videoId, list: w.list, index: w.index,
-        t: v ? v.currentTime : 0,
+        site: site().id,
+        key: item.key,
+        url: site().playerUrl(item, t),
+        t,
+        d: live ? null : v.duration,
         screen: YTPM.screenInfo(),
       });
       if (!res?.ok) return toast('Could not open the player window: ' + (res?.error || 'no response from the extension'));
@@ -240,7 +249,7 @@ YTPM.Controller = (() => {
     if (active && session?.id === s.id) return;
     session = s;
     if (!active) {
-      const v = YTPM.findVideo();
+      const v = site().findVideo();
       prevMuted = v ? v.muted : null;
       enteredAt = Date.now();
       if (!starting) startedHere = false;
@@ -266,13 +275,12 @@ YTPM.Controller = (() => {
     ui?.host.remove();
     ui = null;
     document.getElementById('ytpm-shield')?.remove();
-    const v = YTPM.findVideo();
+    const v = site().findVideo();
     if (v) {
       v.muted = prevMuted ?? false;
       // Leave the Mac paused at the point the TV reached.
-      if (final && final.videoId === YTPM.parseWatch(location.href).videoId && Number.isFinite(final.t)) {
-        v.currentTime = final.t;
-      }
+      const here = site().parse(location.href)?.key;
+      if (final && !final.live && final.key === here && Number.isFinite(final.t)) v.currentTime = final.t;
     }
     session = null;
     st = null;
@@ -285,13 +293,14 @@ YTPM.Controller = (() => {
     lastNavAt = Date.now();
     if (!active) return;
     holdAllLocal();
-    // Picking another video here (watch page, Short or live link) plays it on
-    // the TV instead. yt-navigate-finish can fire twice for one navigation.
-    const w = YTPM.parseWatch(location.href);
-    const repeat = lastLoad.id === w.videoId && Date.now() - lastLoad.at < 2000;
-    if (w.videoId && w.videoId !== st?.videoId && !repeat) {
-      lastLoad = { id: w.videoId, at: Date.now() };
-      command('load', { videoId: w.videoId, list: w.list, index: w.index, t: w.t || 0 });
+    // Picking another video here (on YouTube a watch page, Short or live
+    // link; on Twitch a channel, VOD or clip) plays it on the TV instead.
+    // A navigation can be reported twice (event and polling).
+    const item = site().followsNavigation ? site().parse(location.href) : null;
+    const repeat = item && lastLoad.id === item.key && Date.now() - lastLoad.at < 2000;
+    if (item && item.key !== st?.key && !repeat) {
+      lastLoad = { id: item.key, at: Date.now() };
+      command('load', { key: item.key, url: site().playerUrl(item, item.t || 0), t: item.t || 0, list: item.list, index: item.index });
       toast('Sent to the TV.');
     }
     attachShield();
@@ -310,7 +319,8 @@ YTPM.Controller = (() => {
         return;
       }
     }
-    if (action === 'seekPercent' && st?.live) return;
+    if (st?.live && (action === 'seekPercent' || action === 'rateStep' || action === 'setRate')) return;
+    if (action === 'next' && st && !st.hasNext) return;
     // Time-based sequence numbers stay increasing across reloads of this tab.
     const seq = Date.now() * 1000 + (++cmdSeq % 1000);
     const id = 'c' + seq.toString(36);
@@ -475,7 +485,7 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
     if (age >= 8000) status += ' · no signal';
     else if (session?.mode === 'airplay') status += st.wireless ? ' · connected' : ' · not connected';
     ui.statusText.textContent = status;
-    ui.title.textContent = st.title || 'YouTube';
+    ui.title.textContent = st.title || 'Video';
     ui.title.title = st.title || '';
 
     const playing = !st.paused && !st.ended;
@@ -485,6 +495,7 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
     }
     const t = currentTime();
     ui.scrub.disabled = !!st.live || !st.d;
+    ui.speed.disabled = !!st.live;
     if (st.live) {
       ui.time.textContent = 'LIVE';
       ui.scrub.value = '1000';

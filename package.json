@@ -1,9 +1,9 @@
 {
   "name": "youtube-presenter-mode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "MIT",
-  "description": "Safari extension: play YouTube on the Apple TV while the Mac tab becomes a remote.",
+  "description": "Safari extension: play YouTube, Twitch or any web video on the Apple TV while the Mac tab becomes a remote.",
   "type": "module",
   "scripts": {
     "test": "node tests/background.test.mjs && node tests/content.test.mjs",

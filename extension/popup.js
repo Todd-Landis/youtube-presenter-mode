@@ -18,7 +18,7 @@ async function refresh() {
     span.textContent = lastState?.title || 'Waiting for the player window…';
   } else {
     b.textContent = 'Idle';
-    span.textContent = 'Open a YouTube video, then start (or press ⌥⇧P).';
+    span.textContent = 'Open a page with a video (YouTube, Twitch or any site), then start or press ⌥⇧P.';
   }
   status.append(b, span);
 }

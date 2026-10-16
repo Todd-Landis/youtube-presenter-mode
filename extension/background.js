@@ -7,8 +7,16 @@ const ext = globalThis.browser ?? globalThis.chrome;
 const sessionStore = ext.storage.session ?? ext.storage.local;
 
 const DEFAULT_SETTINGS = { mode: 'extended', autoFullscreen: true, windowType: 'popup' };
-// Any youtube.com page, including consent and sign-in subdomains.
-const YT_URL = /^https:\/\/([a-z0-9-]+\.)*youtube\.com\//i;
+// Same site, roughly: the last two labels of the host match (youtube.com and
+// consent.youtube.com; twitch.tv and clips.twitch.tv).
+function sameSite(a, b) {
+  try {
+    const base = (h) => new URL(h).hostname.split('.').slice(-2).join('.');
+    return base(a) === base(b);
+  } catch {
+    return false;
+  }
+}
 
 let S; // session; undefined = not loaded yet, null = none
 let lastState = null;
@@ -37,6 +45,18 @@ async function loadSession() {
 async function saveSession() {
   if (S) await sessionStore.set({ session: S });
   else await sessionStore.remove('session');
+  await setPresence(S ? { active: true } : null);
+}
+
+// A hint in shared storage that content scripts read before saying hello,
+// so idle pages on every site don't wake this background page.
+let presenceShown;
+async function setPresence(p) {
+  const key = JSON.stringify(p);
+  if (key === presenceShown) return;
+  presenceShown = key;
+  if (p) await ext.storage.local.set({ presence: p });
+  else await ext.storage.local.remove('presence');
 }
 
 async function getSettings() {
@@ -91,16 +111,6 @@ const pickWin = (w) => w && { id: w.id, left: w.left, top: w.top, width: w.width
 const sameScreen = (a, b) => !!a && !!b && a.sw === b.sw && a.sh === b.sh && a.al === b.al && a.at === b.at;
 const fillsScreen = (s) => !!s && s.iw >= s.sw - 2 && s.ih >= s.sh - 2;
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function watchUrl({ videoId, list, index, t }) {
-  const u = new URL('https://www.youtube.com/watch');
-  u.searchParams.set('v', videoId);
-  if (list) u.searchParams.set('list', list);
-  if (index) u.searchParams.set('index', index);
-  if (t > 1) u.searchParams.set('t', Math.floor(t) + 's');
-  u.hash = 'ytpm-player';
-  return u.href;
-}
 
 function toTab(tabId, msg) {
   return ext.tabs.sendMessage(tabId, msg).catch(() => null);
@@ -164,7 +174,7 @@ function startSession(msg, tab) {
 
 async function doStart(msg, tab) {
   const cur = await loadSession();
-  if (cur && cur.controllerTabId === tab.id && cur.videoId === msg.videoId && Date.now() - cur.startedAt < 8000) {
+  if (cur && cur.controllerTabId === tab.id && cur.key === msg.key && Date.now() - cur.startedAt < 8000) {
     return { ok: true, session: cur };
   }
   if (cur) await endSession('replaced', { waitForStart: false });
@@ -183,7 +193,10 @@ async function doStart(msg, tab) {
     bounds = tvBounds ?? { left: (ctrl.al ?? 0) + ctrl.sw, top: ctrl.at ?? 0, width: 1280, height: 720 };
   }
 
-  const url = watchUrl(msg);
+  // The site adapter in the controller chose what the TV should open.
+  if (!/^https?:\/\//i.test(msg.url || '')) return { ok: false, error: 'nothing to open on the TV' };
+  const url = msg.url;
+  await setPresence({ starting: Date.now() });
   const attempts = [
     { url, ...bounds, type: settings.windowType, focused: settings.mode === 'airplay' },
     { url, ...bounds },
@@ -199,13 +212,19 @@ async function doStart(msg, tab) {
       errors.push({ opts: { ...opts, url: undefined }, error: String(e?.message || e) });
     }
   }
-  if (!win) return { ok: false, error: 'windows.create failed: ' + errors.map((e) => e.error).join('; ') };
+  if (!win) {
+    await setPresence(null);
+    return { ok: false, error: 'windows.create failed: ' + errors.map((e) => e.error).join('; ') };
+  }
 
   const playerTab = win.tabs?.[0] ?? (await ext.tabs.query({ windowId: win.id }))[0];
   S = {
     id: Math.random().toString(36).slice(2, 10),
     mode: settings.mode,
-    videoId: msg.videoId,
+    site: msg.site || 'generic',
+    key: msg.key,
+    url,
+    d: msg.d ?? null,
     startT: msg.t || 0,
     controllerTabId: tab.id,
     controllerWindowId: tab.windowId,
@@ -241,7 +260,7 @@ async function doStart(msg, tab) {
     controllerScreen: ctrl,
     rememberedBoundsUsed: !!tvBounds && settings.mode !== 'airplay',
   };
-  log('bg', 'session started', { mode: settings.mode, videoId: msg.videoId, t: msg.t });
+  log('bg', 'session started', { mode: settings.mode, site: msg.site, key: msg.key, t: msg.t });
   // Where did Safari actually put it? If it ignored the position, move it.
   delay(1500).then(async () => {
     try {
@@ -293,7 +312,7 @@ function heartbeat(state) {
   }
   if (state.tickGap) s2.maxTickGapMs = Math.max(s2.maxTickGapMs, state.tickGap);
   const prev = hb.prev;
-  if (prev && prev.videoId === state.videoId) {
+  if (prev && prev.key === state.key) {
     if (prev.vis !== state.vis) push(s2.visibility, { at: now, vis: state.vis, focus: state.focus }, 50);
     if (state.frames && prev.frames && state.frames.dropped >= prev.frames.dropped) {
       s2.droppedFrames += state.frames.dropped - prev.frames.dropped;
@@ -457,8 +476,8 @@ async function onPlayerState(state, sender) {
   if (state.bridge) D.controls.bridge = state.bridge;
   // Follow the player (autoplay-next, a video picked on the TV) and keep a
   // recent position, so a reloaded player page resumes the right video.
-  if (state.videoId && state.videoId !== s.videoId) {
-    s.videoId = state.videoId;
+  if (state.key && state.key !== s.key) {
+    s.key = state.key;
     s.lastT = state.t;
     await saveIf(s);
   } else if (Date.now() - s.lastTSavedAt > 5000) {
@@ -505,13 +524,15 @@ async function handle(msg, sender) {
       if (role === 'player') {
         // A (re)loaded player page: resume from the last known position of
         // the video it should show, and allow fresh fullscreen attempts.
-        const t = lastState?.videoId === s.videoId ? lastState.t : s.lastT;
+        const t = lastState?.key === s.key ? lastState.t : s.lastT;
         if (Number.isFinite(t) && t > s.startT) s.startT = t;
         s.fsSeen = false;
         s.fsAutoAttempts = 0;
         await saveIf(s);
       }
-      return { role, session: role ? s : null, settings: await getSettings() };
+      // A tab we don't know yet, while a start is in flight, may be the new
+      // player window: tell it to ask again shortly.
+      return { role, session: role ? s : null, settings: await getSettings(), wait: !role && !!startLock };
     }
     case 'start':
       return startSession(msg, sender.tab);
@@ -524,9 +545,10 @@ async function handle(msg, sender) {
     case 'cmd': {
       const s = await loadSession();
       if (!s) return { ok: false, error: 'no active session' };
-      if (msg.action === 'load' && msg.value?.videoId) {
+      if (msg.action === 'load' && msg.value?.key) {
         // A full page load in the player re-reads startT on hello.
-        s.videoId = msg.value.videoId;
+        s.key = msg.value.key;
+        if (msg.value.url) s.url = msg.value.url;
         s.startT = s.lastT = msg.value.t || 0;
         await saveSession();
       }
@@ -564,7 +586,7 @@ async function handle(msg, sender) {
     case 'popup:start': {
       const [tab] = await ext.tabs.query({ active: true, currentWindow: true });
       if (!tab) return { ok: false, error: 'no active tab' };
-      return (await toTab(tab.id, { type: 'start-request' })) ?? { ok: false, error: 'Open a YouTube video tab first (reload it if it was open before the extension was installed).' };
+      return (await toTab(tab.id, { type: 'start-request' })) ?? { ok: false, error: 'Open a page with a video first (reload it if it was open before the extension was installed, and allow the extension on that site).' };
     }
     case 'popup:end':
       return endSession('popup');
@@ -593,6 +615,9 @@ async function handle(msg, sender) {
   return { ok: false, error: 'unknown message ' + msg.type };
 }
 
+// Whenever this page starts, make the presence hint match reality.
+loadSession().then((s) => setPresence(s ? { active: true } : null)).catch(() => {});
+
 ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   handle(msg, sender).then(sendResponse, (e) => sendResponse({ ok: false, error: String(e?.message || e) }));
   return true;
@@ -614,19 +639,14 @@ ext.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
+// The player window navigating to another site ends the session. (New windows
+// can report about:blank before their URL, so only real pages count.) The
+// controller tab may go anywhere: its content script runs on every site.
 ext.tabs.onUpdated.addListener(async (tabId, info) => {
-  // Only a real page outside YouTube counts as leaving. New windows can report
-  // about:blank before their URL.
-  if (!info.url || !/^https?:/i.test(info.url) || YT_URL.test(info.url)) return;
+  if (!info.url || !/^https?:/i.test(info.url)) return;
   const s = await loadSession();
-  if (!s) return;
-  if (tabId === s.playerTabId) await endSession('player-closed');
-  else if (tabId === s.controllerTabId) {
-    S = null;
-    await saveSession();
-    toTab(s.playerTabId, { type: 'orphaned' });
-    log('bg', 'controller tab left YouTube; player window released');
-  }
+  if (!s || tabId !== s.playerTabId || sameSite(info.url, s.url)) return;
+  await endSession('player-closed');
 });
 
 ext.commands?.onCommand.addListener(async (command) => {
