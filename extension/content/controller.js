@@ -180,10 +180,12 @@ YTPM.Controller = (() => {
         onclick: (e) => {
           e.preventDefault();
           e.stopPropagation();
-          toggle();
+          toggle({ inClick: true });
         },
       }, icon('present', 24));
       if (!site().insertButton(btn)) return;
+      // Move mode, if on, can then open its window straight from this button.
+      if (site().canMove) YTPM.Move.warm();
     }
     btn.style.color = active ? '#3ea6ff' : '#fff';
   }
@@ -211,24 +213,28 @@ YTPM.Controller = (() => {
 
   // ---- session ---------------------------------------------------------------------
 
-  function toggle() {
+  function toggle(opts) {
     // A slow double-click on the presenter button shouldn't start and then end.
     if (active && Date.now() - enteredAt < 1000) return;
-    return active ? end() : start();
+    return active ? end() : start(opts);
   }
 
-  async function start() {
+  // opts.inClick: called straight from a click on the presenter button.
+  async function start(opts) {
     if (starting) return; // double-click
     const item = site().parse(location.href);
     if (!item) return toast('Open a video first.');
     const v = site().findVideo();
     if (!v) return toast('No video found on this page.');
     if (site().canMove) {
+      // Decided without waiting when possible: a click on the presenter
+      // button can then open move mode's TV window itself.
+      let move = YTPM.Move.wantedNow();
+      const inClick = move !== null && !!opts?.inClick;
       starting = true;
-      let move = false;
       try {
-        move = await YTPM.Move.wanted();
-        if (move) await startMoved(item, v);
+        if (move === null) move = await YTPM.Move.wanted();
+        if (move) await startMoved(item, v, inClick);
       } finally {
         starting = false;
       }
@@ -260,7 +266,7 @@ YTPM.Controller = (() => {
 
   // Move mode (experimental): instead of opening the page's address on the
   // TV, open a window from this page and move this page's own video into it.
-  async function startMoved(item, v) {
+  async function startMoved(item, v, inClick) {
     const live = !Number.isFinite(v.duration);
     const res = await YTPM.Move.begin(v, (extra) => {
       toast('Opening the TV window…');
@@ -269,7 +275,7 @@ YTPM.Controller = (() => {
         type: 'start', site: site().id, key: item.key, url: location.href,
         t, d: live ? null : v.duration, screen: YTPM.screenInfo(), ...extra,
       });
-    });
+    }, { inClick });
     if (!res) return;
     if (!res.ok) return toast('Could not start presenter mode: ' + (res.error || 'no response from the extension'));
     if (endedSessions.has(res.session.id)) return void YTPM.Move.stop();

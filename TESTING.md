@@ -5,7 +5,7 @@ Three layers, from fast to thorough:
 | Command | What it covers | Time |
 |---|---|---|
 | `npm test` | Unit tests: background logic against mocked extension APIs, content scripts in jsdom | ~10 s |
-| `npm run test:system` | 57 end-to-end scenarios (three of them fuzzer runs), against simulated Safari, YouTube, Twitch, a generic site and a feed | ~6 min |
+| `npm run test:system` | 60 end-to-end scenarios (three of them fuzzer runs), against simulated Safari, YouTube, Twitch, generic sites and a feed | ~6 min |
 | `npm run spike` | Move-mode spike: what Safari does with a `<video>` moved into another window ([below](#move-mode)) | ~5 min, by hand |
 | Manual checklist below | The things only real Safari and a real Apple TV can show | ~10 min |
 
@@ -16,6 +16,7 @@ Three layers, from fast to thorough:
   - **YouTube**, with Shorts and live and broken videos
   - **Twitch**, modelled on the real page: a transformed ancestor around the player, `data-a-target` controls, live channels, VODs, clips and a mature-content gate
   - **a generic site**, with a muted looping hero video as a decoy and the real player nested under transformed containers
+  - **players with their own control bar**: one modelled on Kick, with unlabelled icon buttons laid out along the bottom of the video, a quality toast above the bar, buttons under the player and an ad placeholder video; and a labelled one (Video.js style)
   - **a feed** (for move mode): three posts with their own players at one address. Their MediaSource videos only play what the page's script has appended, a few seconds ahead, topped up on the page's timers (`?src=file` makes them plain files instead). Like an IntersectionObserver, the feed pauses a video once it has left the page
 - They're wired through a simulated Safari extension layer that can be made to misbehave:
   - drop or delay messages in either direction, or lose replies
@@ -26,7 +27,7 @@ Three layers, from fast to thorough:
   - toggle a window back out of fullscreen if fullscreen is requested again
   - fail to load the page-world bridge, as Safari ignores the manifest's `world` key
   - close tabs, reload pages, disconnect the TV display, or have the user leave fullscreen
-  - for move mode: `window.open` popups that need a click (Safari's pop-up blocker) but can be found again by name without one, about:blank popups with no content script whose document the opener scripts, `navigator.userActivation`, hidden pages whose timers fire at most once a second (optionally with the feed's feeding stopping), a closed popup destroying any video still in it, Chromium's reset of a media element moved to another document, and tab titles or opener IDs not being reported
+  - for move mode: `window.open` popups that only open while a click is being handled (Safari's pop-up blocker) but can be found again by name without one, about:blank popups with no content script whose document the opener scripts, `navigator.userActivation`, hidden pages whose timers fire at most once a second (optionally with the feed's feeding stopping), a closed popup destroying any video still in it, Chromium's reset of a media element moved to another document, and tab titles or opener IDs not being reported
 
 `tests/system.test.mjs` holds the scenarios. Each one describes the expected behaviour, so a failure is a real regression.
 
@@ -109,6 +110,7 @@ Found by reading the code, by checking real YouTube behaviour in a browser, and 
 The extension is split into a shared core and per-site adapters (`content/sites/`). Checked against the live sites first:
 - **Twitch:** one `<video>` (duration `Infinity` when live) inside `[data-a-target="video-player"]`. An ancestor has a CSS transform, so the usual `position: fixed` fill doesn't work. The player is lifted into the top layer instead, which filled the window on a live channel. Twitch's content-classification label and extension overlays also had to be hidden.
 - **Generic site:** the page's largest `<video>`, lifted into the top layer, filled the window and kept playing.
+- **Kick** (checked live on 2026-10-16): a plain `<video id="video-player">` in the page (no iframe) with Kick's own control bar over it. Its buttons are icons with no `aria-label`, title or text, and fullscreen is last in the right-hand group.
 
 Problems that came up while generalising, and what was done about them:
 
@@ -122,6 +124,9 @@ Problems that came up while generalising, and what was done about them:
 | Speed and percentage seeks on live streams | Ignored, and the speed menu is disabled |
 | The TV's own prompts would sit under a top-layer player | Prompts go in the top layer too, above it |
 | The controller was dropped when its tab left YouTube | Its content script runs everywhere now, so it stays the controller; only the TV leaving the session's site ends it |
+| Sites with a player of their own (Kick, Video.js, JW Player…) had no presenter button | The generic adapter finds the player's fullscreen button, by label, else as the right-most button in the lowest row of at least three buttons over the bottom quarter of the video. The presenter button goes before it, and the paused Mac player is covered. It never looks past a box holding another player or three times the video's size (scenarios: player with unlabelled / labelled controls) |
+| Utility-class sites put state variants such as `group-data-[fullscreen=true]:…` on all sorts of elements | Only plain class names count as labels |
+| Players without a control bar of their own would be searched every second | A miss is cached for 5 s per video |
 
 ## Move mode
 
@@ -132,6 +137,7 @@ Move mode (experimental, sites other than YouTube and Twitch, off by default) is
 | Situation | What happens | Scenario |
 |---|---|---|
 | Started from the toolbar or ⌥⇧P, so there's no click on the page and Safari would block the popup | The page asks "Move this video to the TV?"; the click on **Move to TV** opens the window. Cancel (or 30 s) starts nothing | cancelling the prompt |
+| Started from the presenter button in the site's player | That click opens the window directly. The settings are loaded once the page has a player, so nothing is awaited inside the click; if Safari still refuses, the prompt appears | move mode from the presenter button |
 | The feed pauses the video once it's no longer on its page (IntersectionObserver), within moments of the move | Played on, even before the background has confirmed the session; at most four times a minute | the feed's own video moves to the TV |
 | The user pauses with the site's own controls on the Mac | Respected (user activation, once the starting click's activation has expired); the remote shows paused | pausing with the site's own controls |
 | A pause from the remote | Not undone by the play-on rule | the feed's own video moves to the TV |
@@ -192,7 +198,7 @@ After `npm run install:mac`, close any old TV window and reload YouTube tabs. Th
 11. Press End: the TV window closes; the Mac tab is parked at the TV's position. Nothing comes back.
 12. **Twitch:** on a live channel, start from the button next to Twitch's fullscreen button. The TV shows only the stream; the bar shows LIVE. Switch channel on the Mac: the TV follows and stays fullscreen. Type in chat: nothing reaches the TV.
 13. **Twitch VOD:** start partway into a past broadcast. The TV starts at the same point; J/L seek.
-14. **Any site:** on a page with a video (a news site or Vimeo, say), press ⌥⇧P. The TV opens the page with just that video filling the screen, from the Mac's position. Allow the extension on that site if Safari asks.
+14. **Any site:** on a page with a video (a news site or Vimeo, say), press ⌥⇧P. The TV opens the page with just that video filling the screen, from the Mac's position. Allow the extension on that site if Safari asks. On a site with its own player (a Kick channel, say), the presenter button sits just left of the player's fullscreen button, and clicking it starts presenter mode.
 15. **Move mode:** turn it on in the toolbar popup. In a feed (X, Reddit or Instagram), play a post's video with sound, press ⌥⇧P and click **Move to TV**. The same video carries on, fullscreen on the TV, with a placeholder in the feed. Try the remote, then switch tabs for a minute, then End: the video is back in the feed, paused. Diagnostics ▸ Copy report includes how the TV window was found (`placement.moveFoundBy`) and any `move-…` events.
 
 If anything misbehaves: Toolbar ▸ Diagnostics ▸ **Copy report**.

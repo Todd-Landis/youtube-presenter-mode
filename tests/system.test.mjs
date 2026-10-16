@@ -583,6 +583,36 @@ test('any site: a page without a video says so', async (world) => {
   noErrors(world);
 });
 
+test('any site, player with unlabelled controls (Kick): presenter button before its fullscreen button', async (world) => {
+  const ctrl = await world.openController(SITE + 'streamer');
+  await until(() => ctrl.presenterButton(), 3000, 'presenter button in the site\'s player');
+  const btn = ctrl.presenterButton();
+  assert.equal(btn.parentElement, ctrl.doc.querySelector('.bar .right'), 'in the bar, not next to the toast or below the player');
+  assert.equal(btn.nextElementSibling, ctrl.doc.querySelector('.b-fs').parentElement, 'right before the fullscreen button');
+  ctrl.userClick(btn);
+  await until(() => tv(world)?.listener && ctrl.bar(), 4000, 'presenting');
+  assert.equal(world.session().move, false, 'the TV opens the page (move mode is off)');
+  await until(() => ctrl.doc.querySelector('.channel-player > #ytpm-shield'), 2000, 'paused Mac player covered');
+  await until(() => !tvVideo(world).v.paused, 3000, 'TV playing');
+  assert.equal(ctrl.yt.v.paused || ctrl.yt.v.muted, true, 'Mac copy silent');
+  // The cover's click plays or pauses to match the bar, as the bar's button does.
+  await until(() => !ctrl.bar().showsPaused, 2000, 'bar shows the TV playing');
+  ctrl.userClick(ctrl.doc.getElementById('ytpm-shield'));
+  await until(() => tvVideo(world).v.paused, 1500, 'clicking the cover pauses the TV');
+  ctrl.barButton('End').click();
+  await until(() => !world.session() && !ctrl.doc.getElementById('ytpm-shield'), 3000, 'ended, cover gone');
+  noErrors(world);
+});
+
+test('any site, player with labelled controls (Video.js, JW, Plyr): button before its Fullscreen control', async (world) => {
+  const ctrl = await world.openController(SITE + 'vjs');
+  await until(() => ctrl.presenterButton(), 3000, 'presenter button (found by label, no layout needed)');
+  assert.equal(ctrl.presenterButton().nextElementSibling, ctrl.doc.querySelector('.b-fs').parentElement);
+  ctrl.userClick(ctrl.presenterButton());
+  await until(() => tv(world)?.listener && ctrl.bar()?.title === 'Labelled player', 4000, 'presenting');
+  noErrors(world);
+});
+
 test('idle pages stay quiet: no messages to the background without a session', async (world) => {
   await world.openController(SITE + 'films/one');
   await world.openController('vidAlpha001');
@@ -623,6 +653,7 @@ test('move mode: the feed\'s own video moves to the TV, keeps playing, comes bac
   assert.equal(world.tabs.get(world.session().playerTabId).url, 'about:blank', 'the TV did not load the feed again');
   assert.equal([...world.tabs.values()].filter((t) => t.page && !t.popup).length, 1, 'no second copy of the page');
   assert.ok(homeOf(ctrl, 'b').querySelector('[data-ytpm-home]'), 'a placeholder keeps its spot in the feed');
+  assert.equal(ctrl.presenterButton(), null, 'no presenter button: the posts have no fullscreen control');
   await until(() => tvWin(world)?.state === 'fullscreen', 3000, 'TV window fullscreen');
   await until(() => ctrl.ioPauses >= 1, 1500, 'the feed paused it for being off-screen');
   await sleep(800);
@@ -801,6 +832,24 @@ test('move mode: a browser that resets moved videos (Chromium): put back, ended 
   assert.equal(post.v.parentElement, homeOf(ctrl, 'b'), 'video back in its spot');
   noErrors(world);
 }, { resetOnAdopt: true });
+
+test('move mode from the presenter button in the site\'s player: the click opens the TV window, no prompt', async (world) => {
+  world.storage.local.settings = { moveVideo: true };
+  const ctrl = await world.openController(SITE + 'streamer');
+  await until(() => ctrl.presenterButton(), 3000, 'presenter button');
+  await sleep(300);
+  ctrl.userClick(ctrl.presenterButton());
+  await until(() => world.session()?.move && ctrl.bar(), 4000, 'presenting in move mode');
+  assert.equal(ctrl.movePrompt(), null, 'no prompt needed');
+  assert.ok(popup(world).doc.contains(ctrl.yt.v), 'the player\'s own video is on the TV');
+  await sleep(1200);
+  assert.equal(ctrl.doc.getElementById('ytpm-shield'), null, 'no cover: a placeholder holds the spot');
+  assert.ok(ctrl.doc.querySelector('.channel-player [data-ytpm-home]'), 'placeholder in the player');
+  ctrl.barButton('End').click();
+  await until(() => !world.session() && world.playerWindows().length === 0, 3000, 'ended');
+  assert.equal(ctrl.yt.v.parentElement, ctrl.doc.querySelector('.channel-player .aspect'), 'video back in the player');
+  noErrors(world);
+});
 
 test('move mode: TV window found without tab titles or openers (lone blank popup)', async (world) => {
   const ctrl = await presentMoved(world);

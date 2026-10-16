@@ -64,6 +64,10 @@ export const CATALOG = {
   'post:a': { title: '', d: 60 },
   'post:b': { title: '', d: 95 },
   'post:c': { title: '', d: 40 },
+  // Players with their own control bar: unlabelled icons laid out like Kick's,
+  // and a labelled one (Video.js, JW Player, Plyr…).
+  'gen:/streamer': { title: 'Streamer live', live: true, custom: 'unlabelled' },
+  'gen:/vjs': { title: 'Labelled player', d: 300, custom: 'labelled' },
   hero: { title: '', d: 1e9, muted: true },
 };
 const NEXT = { vidAlpha001: 'vidBravo002', vidBravo002: 'vidCharl003', vidCharl003: 'vidAlpha001' };
@@ -509,6 +513,31 @@ const FEED_HTML = (title) => `<!doctype html><html><head><title>${title}</title>
 </div></article>`).join('')}
 </main></body></html>`;
 
+// A player with its own control bar, modelled on Kick: icon buttons (labelled
+// or not), fullscreen last in the bar, a quality toast above the bar, an ad
+// placeholder video outside the player, and buttons under it.
+const CUSTOM_HTML = (title, labelled) => `<!doctype html><html><head><title>${title}</title></head><body>
+<header><input id="search" type="text"></header>
+<main><div class="channel-player" style="position:relative">
+<div class="aspect"><video id="video-player" class="player-no-controls"></video></div>
+<div class="toast"><button class="t1">Try 1080p</button><button class="t2">Not now</button></div>
+<div class="bar"><div class="left"><button class="b-play"></button><button class="b-vol"></button><button class="b-live">LIVE</button></div>
+<div class="right"><button class="b-settings"></button><button class="b-clip">Clip</button><button class="b-theatre"></button>
+<div><button class="b-fs${labelled ? ' vjs-fullscreen-control" title="Fullscreen' : ''}"></button></div></div></div>
+</div><video-player><video class="ad" muted></video></video-player></main>
+<div class="below"><button>Follow</button><button>Subscribe</button><button>Share</button></div>
+</body></html>`;
+
+// Layout for the unlabelled player (jsdom has none): a 1280×720 video with the
+// bar along its bottom edge.
+const CUSTOM_LAYOUT = {
+  '.channel-player': [0, 100, 1280, 720], '.aspect': [0, 100, 1280, 720], '#video-player': [0, 100, 1280, 720],
+  '.t1': [1080, 700, 90, 36], '.t2': [1180, 700, 90, 36],
+  '.b-play': [16, 776, 36, 36], '.b-vol': [60, 776, 36, 36], '.b-live': [104, 776, 48, 36],
+  '.b-settings': [1060, 776, 36, 36], '.b-clip': [1104, 776, 48, 36], '.b-theatre': [1160, 776, 36, 36],
+  '.b-fs': [1210, 776, 36, 36], '.below button': [0, 840, 90, 36],
+};
+
 class Page {
   constructor(world, tab, url) {
     this.world = world;
@@ -534,7 +563,8 @@ class Page {
     this.site = siteOf(url);
     const html = this.site === 'youtube' ? PAGE_HTML(meta.title)
       : this.site === 'twitch' ? TWITCH_HTML(meta.title, meta.gate)
-        : meta.feed ? FEED_HTML(meta.title) : GENERIC_HTML(meta.title, meta.none);
+        : meta.feed ? FEED_HTML(meta.title) : meta.custom ? CUSTOM_HTML(meta.title, meta.custom === 'labelled')
+          : GENERIC_HTML(meta.title, meta.none);
     this.dom = new JSDOM(html, { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: vc });
     const w = (this.win = this.dom.window);
     this.doc = w.document;
@@ -546,7 +576,16 @@ class Page {
     this.installTimers();
     this.installVisibility();
     this.installWindowOpen();
-    if (meta.feed) {
+    if (meta.custom) {
+      this.yt = this.installPlayer(this.doc.querySelector('.channel-player'), { id, autoplay: true, videoEl: this.doc.getElementById('video-player') });
+      if (meta.custom === 'unlabelled') {
+        for (const [sel, [left, top, width, height]] of Object.entries(CUSTOM_LAYOUT)) {
+          for (const el of this.doc.querySelectorAll(sel)) {
+            el.getBoundingClientRect = () => ({ left, top, width, height, right: left + width, bottom: top + height, x: left, y: top });
+          }
+        }
+      }
+    } else if (meta.feed) {
       // ?src=file: the posts are plain video files instead of MediaSource streams.
       const src = new URL(url).searchParams.get('src') === 'file' ? 'file' : 'mse';
       this.posts = {};
@@ -652,7 +691,8 @@ class Page {
     this.win.open = (url, name, features) => {
       const existing = name && [...page.world.popups].find((p) => p.name === name && !p.closed && p.tab.openerTabId === page.tab.id);
       if (existing) return existing.proxy;
-      if (Date.now() >= page.gestureUntil && page.world.o.popups !== 'allow') return null;
+      // Only while a click is being handled, not after an await (like WebKit).
+      if (!page.clicking && page.world.o.popups !== 'allow') return null;
       return new Popup(page.world, page, name || '', features).proxy;
     };
   }
@@ -696,10 +736,12 @@ class Page {
     };
   }
 
-  // A real user click: grants transient activation for a second.
+  // A real user click: grants transient activation for a second, and lets a
+  // popup open while its handlers run.
   userClick(el) {
     this.gestureUntil = Date.now() + 1000;
-    el.click();
+    this.clicking = true;
+    try { el.click(); } finally { this.clicking = false; }
   }
 
   // ---- a fake player: a simulated <video>, plus YouTube's #movie_player API

@@ -53,37 +53,57 @@ YTPM.Move = (() => {
   const tracks = (v) => [...(v?.textTracks || [])].filter((t) => t.kind === 'subtitles' || t.kind === 'captions');
   const event = (name, data, notify = false) => YTPM.send({ type: 'event', name, data: data ?? null, notify });
 
+  // The settings and the TV window's last spot, kept at hand: started from a
+  // click on the page, window.open has to run within that click, before any
+  // await. warm() loads them once the page has a player worth presenting.
+  let cache = null;
+  let watching = false;
+  async function warm() {
+    try {
+      const { settings } = await YTPM.ext.storage.local.get('settings');
+      const { tvBounds } = await YTPM.ext.storage.local.get('tvBounds');
+      cache = { settings: settings || {}, tvBounds: tvBounds || null };
+    } catch {}
+    if (!watching && YTPM.ext.storage?.onChanged?.addListener) {
+      watching = true;
+      YTPM.ext.storage.onChanged.addListener(() => { warm(); });
+    }
+    return cache;
+  }
+
   // On, on a site that allows it, with the extended-display mode (AirPlay
   // video needs the player window's AirPlay handling, which this doesn't have).
+  const isOn = (c) => !!c?.settings.moveVideo && c.settings.mode !== 'airplay';
+  // Without waiting: true or false, or null if the settings aren't loaded yet.
+  const wantedNow = () => (!site().canMove ? false : cache ? isOn(cache) : null);
   async function wanted() {
     if (!site().canMove) return false;
-    try {
-      const settings = (await YTPM.ext.storage.local.get('settings')).settings;
-      return !!settings?.moveVideo && settings.mode !== 'airplay';
-    } catch {
-      return false;
-    }
+    return isOn(await warm());
   }
 
   // Where the TV window goes: where it was last time, else right of this screen.
-  async function tvBounds() {
-    let b = null;
-    try { b = (await YTPM.ext.storage.local.get('tvBounds')).tvBounds; } catch {}
+  function tvBounds() {
     const s = YTPM.screenInfo();
-    return b || { left: (s.al ?? 0) + s.sw, top: s.at ?? 0, width: 1280, height: 720 };
+    return cache?.tvBounds || { left: (s.al ?? 0) + s.sw, top: s.at ?? 0, width: 1280, height: 720 };
   }
 
   // ---- starting ------------------------------------------------------------------
 
-  // window.open needs a click on the page. Started from the toolbar or the
-  // shortcut there isn't one, so ask for it. sendStart(extra) asks the
-  // background to start the session; resolves to its reply, or null.
-  async function begin(v, sendStart) {
-    const bounds = await tvBounds();
+  // window.open needs a click on the page, and must run within it. inClick:
+  // this call comes straight from one (the presenter button in the site's
+  // player). Otherwise (toolbar, shortcut) ask for a click. sendStart(extra)
+  // asks the background to start the session; resolves to its reply, or null.
+  async function begin(v, sendStart, { inClick = false } = {}) {
+    // Only use the click if nothing has been awaited since it.
+    const now = inClick && !!cache;
+    if (!cache) await warm();
+    const bounds = tvBounds();
     return new Promise((resolve) => {
-      const go = () => {
+      const go = (direct) => {
         closePrompt();
         const opened = openAndMove(v, bounds);
+        // Straight from a click Safari still refused: ask for one instead.
+        if (!opened && direct) return showPrompt(() => go(false), () => resolve(null));
         if (!opened) {
           hooks.toast('Safari blocked the TV window. Try again, or allow pop-ups for this site.');
           return resolve(null);
@@ -93,8 +113,8 @@ YTPM.Move = (() => {
           return res;
         }));
       };
-      if (navigator.userActivation?.isActive) go();
-      else showPrompt(go, () => resolve(null));
+      if (now) go(true);
+      else showPrompt(() => go(false), () => resolve(null));
     });
   }
 
@@ -596,5 +616,5 @@ YTPM.Move = (() => {
     return null;
   }
 
-  return { setHooks, owns, isActive, wanted, begin, start, resume, stop, onMessage };
+  return { setHooks, owns, isActive, warm, wanted, wantedNow, begin, start, resume, stop, onMessage };
 })();

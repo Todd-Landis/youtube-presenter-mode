@@ -28,7 +28,7 @@ popup:
 
 | | YouTube | Twitch | Any other site |
 |---|---|---|---|
-| Start from | Button in the player controls, ⌥⇧P, toolbar | Button in the player controls, ⌥⇧P, toolbar | ⌥⇧P or toolbar |
+| Start from | Button in the player controls, ⌥⇧P, toolbar | Button in the player controls, ⌥⇧P, toolbar | Button in the player controls if the site's player has its own control bar (Kick, Video.js, JW Player…), ⌥⇧P, toolbar |
 | What plays on the TV | Watch pages, Shorts, live links | Live channels, past broadcasts, clips | The page's main video (the largest; muted background loops are ignored) |
 | Picking another video on the Mac | Plays it on the TV | Plays it on the TV | Start again on the new page |
 | Captions | Yes | When the stream has them | When the site uses standard caption tracks |
@@ -44,9 +44,10 @@ Reddit, Instagram) the address doesn't say which video you were watching, so
 the TV may show a different one. **Move mode** (toolbar popup ▸ "Move the video
 instead of reopening the page") moves the video you're watching instead:
 
-1. Start as usual with ⌥⇧P or the toolbar. The page asks **Move this video to
-   the TV?** Click **Move to TV**: Safari only lets a page open a window from a
-   click on it.
+1. Start with the presenter button in the site's player, if it has one, and
+   the TV window opens straight away. From ⌥⇧P or the toolbar, the page first
+   asks **Move this video to the TV?** Click **Move to TV**: Safari only lets a
+   page open a window from a click on it.
 2. The page opens a window and moves its own `<video>` element into it. The
    extension puts that window on the TV and makes it fullscreen, as usual.
 3. The site's scripts keep running that element from the original tab, so the
@@ -135,8 +136,10 @@ fullscreen and remembers that spot for next time.
 
 ## Usage
 
-**Start** with the presenter button in YouTube's or Twitch's player controls
-(next to fullscreen), **⌥⇧P**, or the toolbar popup.
+**Start** with the presenter button in the player controls (next to
+fullscreen), **⌥⇧P**, or the toolbar popup. The button is there on YouTube and
+Twitch, and on other sites whose player draws its own control bar with a
+fullscreen button.
 
 **Remote bar:** title, play/pause, ±10 s, scrubber, speed, captions,
 mute/volume, TV fullscreen, collapse and **End**. Live streams show LIVE
@@ -250,6 +253,12 @@ presenter button goes, how captions toggle, which prompts to dismiss, and how
 to switch videos. Adding a site means adding one file to `content/sites/` and
 listing it in the manifest.
 
+The generic adapter finds a site's own control bar by itself. It looks for
+the player's fullscreen button, first by its label (most players label it),
+else as the right-most button in the lowest row of at least three buttons over
+the bottom of the video (players with unlabelled icons, such as Kick's). The
+presenter button goes just before it.
+
 On the TV, YouTube's player is resized with CSS. Twitch and generic sites have
 their player lifted into the browser's top layer (the popover API), which
 escapes any transform or stacking on the page.
@@ -266,8 +275,10 @@ and never assign `innerHTML`.
   the address identifies the video. In feeds (X, Reddit, Instagram) the TV may
   land on a different video; try [move mode](#move-mode-experimental), which
   has limits of its own. Players that only create their `<video>` after you
-  click play need one click on the TV. Videos inside iframes aren't picked up
-  yet.
+  click play need one click on the TV. Videos inside iframes or shadow DOM
+  aren't picked up yet. The presenter button only appears in players with
+  their own control bar and fullscreen button; elsewhere use ⌥⇧P or the
+  toolbar.
 - DRM services (Netflix, Disney+, Prime Video) will likely show black on an
   AirPlay display, or refuse a second stream.
 - Opening a playlist link from the controller reloads the player page.
