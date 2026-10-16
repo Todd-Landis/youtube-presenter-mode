@@ -37,6 +37,8 @@ YTPM.Controller = (() => {
     'player-closed': 'The TV window was closed. Presenter mode ended.',
     replaced: 'Presenter mode moved to another tab.',
     unreachable: "Couldn't reach the TV window. If it's still open, close it yourself.",
+    'controller-reloaded': 'The TV video stopped when this page reloaded (in move mode the page plays it). Start again.',
+    'move-reset': "Safari restarted the video when moving it to the TV, so move mode can't work on this site. Turn it off in the toolbar popup.",
   };
   // Holding these keys keeps acting; everything else fires once per press.
   const REPEATABLE = new Set(['seekBy', 'volumeBy']);
@@ -107,10 +109,12 @@ YTPM.Controller = (() => {
   }
 
   function holdAllLocal() {
-    site().localVideos().forEach(holdLocal);
+    // In move mode the main video is the one on the TV.
+    site().localVideos().forEach((v) => { if (!YTPM.Move.owns(v)) holdLocal(v); });
   }
 
   function installGuards() {
+    YTPM.Move.setHooks({ command, toast, ended: (reason) => exit(st, reason) });
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', swallowKey, true);
     window.addEventListener('keypress', swallowKey, true);
@@ -157,7 +161,10 @@ YTPM.Controller = (() => {
   }
 
   function init(hello) {
-    if (hello?.role === 'controller' && hello.session) enter(hello.session);
+    if (hello?.role !== 'controller' || !hello.session) return;
+    enter(hello.session);
+    // Move mode: this page reloaded; the video on the TV was this page's.
+    if (hello.session.move) YTPM.Move.resume(hello.session);
   }
 
   // ---- presenter button in the site's player controls ------------------------------
@@ -216,6 +223,17 @@ YTPM.Controller = (() => {
     if (!item) return toast('Open a video first.');
     const v = site().findVideo();
     if (!v) return toast('No video found on this page.');
+    if (site().canMove) {
+      starting = true;
+      let move = false;
+      try {
+        move = await YTPM.Move.wanted();
+        if (move) await startMoved(item, v);
+      } finally {
+        starting = false;
+      }
+      if (move) return;
+    }
     const live = !Number.isFinite(v.duration);
     const t = live ? 0 : v.currentTime;
     starting = true;
@@ -240,8 +258,31 @@ YTPM.Controller = (() => {
     }
   }
 
+  // Move mode (experimental): instead of opening the page's address on the
+  // TV, open a window from this page and move this page's own video into it.
+  async function startMoved(item, v) {
+    const live = !Number.isFinite(v.duration);
+    const res = await YTPM.Move.begin(v, (extra) => {
+      toast('Opening the TV window…');
+      const t = live ? 0 : v.currentTime;
+      return YTPM.sendRetry({
+        type: 'start', site: site().id, key: item.key, url: location.href,
+        t, d: live ? null : v.duration, screen: YTPM.screenInfo(), ...extra,
+      });
+    });
+    if (!res) return;
+    if (!res.ok) return toast('Could not start presenter mode: ' + (res.error || 'no response from the extension'));
+    if (endedSessions.has(res.session.id)) return void YTPM.Move.stop();
+    startedHere = true;
+    enter(res.session);
+    YTPM.Move.start(res.session);
+  }
+
   async function end() {
+    // Move mode: put the video back in the page before its window closes.
+    const tv = session?.move ? YTPM.Move.stop({ closeTv: false }) : null;
     const res = await YTPM.sendRetry({ type: 'end', reason: 'user' });
+    if (!res) try { tv?.close(); } catch {}
     exit(res?.final ?? st, res ? 'user' : 'unreachable');
   }
 
@@ -276,7 +317,9 @@ YTPM.Controller = (() => {
     ui = null;
     document.getElementById('ytpm-shield')?.remove();
     const v = site().findVideo();
-    if (v) {
+    // Move mode puts its video back (paused) itself.
+    if (session?.move) YTPM.Move.stop();
+    else if (v) {
       v.muted = prevMuted ?? false;
       // Leave the Mac paused at the point the TV reached.
       const here = site().parse(location.href)?.key;
@@ -524,7 +567,9 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
       ? 'The player window stopped reporting. It may be closed, frozen or throttled.'
       : st.error
         ? `The TV can't play this video (${st.error}).`
-        : NEEDS_CLICK[st.overlay];
+        : st.stalled
+          ? 'The TV video is stuck. In move mode this tab plays it: keep the tab open and visible.'
+          : NEEDS_CLICK[st.overlay];
     ui.warn.classList.toggle('show', !!warn);
     ui.warnText.textContent = warn || '';
   }
@@ -579,6 +624,11 @@ select { -webkit-appearance: none; appearance: none; height: 28px; padding: 0 8p
       case 'start-request':
         toggle();
         return { ok: true };
+      // Move mode: this tab stands in for the TV window, which has no content script.
+      case 'cmd':
+      case 'getState':
+      case 'needFullscreenClick':
+        return YTPM.Move.onMessage(msg) ?? { ok: false, error: 'not presenting from this tab' };
       case 'event':
         if (msg.name === 'airplay-disconnected') toast('AirPlay disconnected. Click the player window to reconnect.');
         if (msg.name === 'airplay-connected') toast('AirPlay connected.');

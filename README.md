@@ -37,6 +37,43 @@ popup:
 On every site: play/pause, seeking, volume and mute. Speed too, except on live
 streams.
 
+### Move mode (experimental)
+
+On other sites, the TV normally opens the same page address. In a feed (X,
+Reddit, Instagram) the address doesn't say which video you were watching, so
+the TV may show a different one. **Move mode** (toolbar popup ▸ "Move the video
+instead of reopening the page") moves the video you're watching instead:
+
+1. Start as usual with ⌥⇧P or the toolbar. The page asks **Move this video to
+   the TV?** Click **Move to TV**: Safari only lets a page open a window from a
+   click on it.
+2. The page opens a window and moves its own `<video>` element into it. The
+   extension puts that window on the TV and makes it fullscreen, as usual.
+3. The site's scripts keep running that element from the original tab, so the
+   stream, position, quality and ad state carry over. A placeholder keeps the
+   video's spot in the feed; clicking it plays or pauses the TV. The remote bar
+   and the shortcuts work as usual.
+4. **End**, or closing the TV window, puts the video back in its spot, paused.
+
+It only applies to sites other than YouTube and Twitch, which keep opening
+their own page, and only with **Extended display**. Its limits:
+- **Playback depends on the original tab.** Closing the tab closes the TV
+  window. Reloading it, or leaving the page, ends presenter mode, unless the
+  video is a plain file rather than a MediaSource stream; a plain file keeps
+  playing and the reloaded page takes over the remote.
+- Safari slows a hidden tab's timers (another tab in front, or the window
+  covered). If the site feeds its video from those timers, the TV can run dry
+  and stall until the tab is visible again. The remote bar flags the stall.
+- If the site tears down its player (say you scroll far away in the feed), the
+  TV stops.
+- Feeds pause videos they can no longer see. Move mode plays on (up to four
+  times a minute), unless you paused it yourself, from the remote or with the
+  site's own controls on the Mac.
+- Whether WebKit keeps a moved video playing is being checked with
+  [the spike](#move-mode-spike). Chromium restarts a moved video; if Safari
+  does the same on a site, the extension puts the video back and says so.
+- Captions only when the site uses standard caption tracks.
+
 ## Install
 
 Requires macOS with Safari 26 or later.
@@ -167,10 +204,22 @@ npm test
 ```
 
 `npm test` runs the quick unit tests. `npm run test:system` runs the
-end-to-end scenarios (YouTube, Twitch and a generic site) against simulated
-Safari and pages, including dropped messages, background restarts, reloads and
-fullscreen failures; see [TESTING.md](TESTING.md). `npm run check`
-syntax-checks every script. `npm run icons` redraws the icons.
+end-to-end scenarios (YouTube, Twitch, a generic site and a feed in move mode)
+against simulated Safari and pages, including dropped messages, background
+restarts, reloads and fullscreen failures; see [TESTING.md](TESTING.md).
+`npm run check` syntax-checks every script. `npm run icons` redraws the icons.
+
+### Move-mode spike
+
+```bash
+npm run spike
+```
+
+This serves a test page on http://localhost:8642/ (open it in Safari). It
+moves a plain MP4 and a MediaSource video into a popup and records whether
+they keep playing, show a picture and stay controllable, and what happens when
+the page is hidden, reloaded or closed. The first run generates the test media
+with AVFoundation (about 15 seconds). See [TESTING.md](TESTING.md#move-mode).
 
 ```
 extension/
@@ -182,6 +231,7 @@ extension/
   content/sites/generic.js   any other site with a <video>
   content/page-bridge.js     runs in YouTube's page context; wraps #movie_player's API
   content/player.js          player window: filling the TV, state reports, commands, overlays, AirPlay
+  content/move.js            move mode: moves the page's own video into a TV window it opens
   content/controller.js      controller tab: presenter button, remote bar, key forwarding
   content/boot.js            picks the site adapter and the tab's role
   popup.*, diagnostics.*     toolbar popup and diagnostics page
@@ -189,6 +239,8 @@ extension/
 scripts/
   install-mac-app.sh         builds, signs and installs the Mac app (permanent install)
   make-icons.swift           icon generator
+  make-spike-media.swift     test media for the move-mode spike
+spike/move-video/            move-mode spike: test page and server (npm run spike)
 tests/                       unit tests, system harness and scenarios (TESTING.md)
 ```
 
@@ -212,9 +264,10 @@ and never assign `innerHTML`.
   `[data-a-target="video-player"]`.
 - Generic sites: the TV opens the same page address, so it suits pages where
   the address identifies the video. In feeds (X, Reddit, Instagram) the TV may
-  land on a different video. Players that only create their `<video>` after
-  you click play need one click on the TV. Videos inside iframes aren't
-  picked up yet.
+  land on a different video; try [move mode](#move-mode-experimental), which
+  has limits of its own. Players that only create their `<video>` after you
+  click play need one click on the TV. Videos inside iframes aren't picked up
+  yet.
 - DRM services (Netflix, Disney+, Prime Video) will likely show black on an
   AirPlay display, or refuse a second stream.
 - Opening a playlist link from the controller reloads the player page.

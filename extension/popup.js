@@ -7,6 +7,7 @@ async function refresh() {
   const { session, lastState, settings } = r;
   for (const el of document.querySelectorAll('input[name=mode]')) el.checked = el.value === settings.mode;
   $('autoFullscreen').checked = !!settings.autoFullscreen;
+  $('moveVideo').checked = !!settings.moveVideo;
   $('start').hidden = !!session;
   $('end').hidden = !session;
   const status = $('status');
@@ -31,6 +32,7 @@ for (const el of document.querySelectorAll('input[name=mode]')) {
   el.addEventListener('change', () => setSettings({ mode: el.value }));
 }
 $('autoFullscreen').addEventListener('change', (e) => setSettings({ autoFullscreen: e.target.checked }));
+$('moveVideo').addEventListener('change', (e) => setSettings({ moveVideo: e.target.checked }));
 
 $('start').addEventListener('click', async () => {
   const r = await ext.runtime.sendMessage({ type: 'popup:start' });

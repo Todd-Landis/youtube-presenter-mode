@@ -20,6 +20,8 @@ YTPM.registerSite((() => {
     usesBridge: false,
     // In-page navigation on an arbitrary site doesn't reliably mean "a new video".
     followsNavigation: false,
+    // Move mode (content/move.js) is offered here only.
+    canMove: true,
     hasNext: false,
     fill: 'popover',
     fillTarget: (video) => video,

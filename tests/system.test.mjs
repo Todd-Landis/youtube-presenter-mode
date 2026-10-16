@@ -591,6 +591,246 @@ test('idle pages stay quiet: no messages to the background without a session', a
   assert.equal(world.bgMessages('hello').length, 0, 'no hello from idle pages');
 });
 
+// ---- move mode (experimental, generic sites) ---------------------------------------
+// The page's own <video> moves into a popup the page opens, instead of the TV
+// reopening the page's address (which in a feed shows some other video).
+
+const FEED = SITE + 'feed';
+
+// Watching the second post of a feed, with sound; start from the toolbar,
+// then click "Move to TV" (window.open needs a click on the page).
+async function presentMoved(world, url = FEED) {
+  world.storage.local.settings = { moveVideo: true };
+  const ctrl = await world.openController(url);
+  ctrl.posts.b.v.muted = false;
+  await ctrl.posts.b.v.play();
+  await sleep(1500);
+  await world.popupStart();
+  await until(() => ctrl.movePrompt(), 2000, '"Move to TV" prompt');
+  ctrl.userClick(ctrl.movePrompt());
+  await until(() => world.session()?.move && ctrl.bar(), 4000, 'presenting in move mode');
+  return ctrl;
+}
+
+const popup = (world) => world.playerPage(); // the Popup the page opened
+const homeOf = (ctrl, post) => ctrl.doc.querySelector(`[data-post="${post}"] .media`);
+
+test('move mode: the feed\'s own video moves to the TV, keeps playing, comes back on End', async (world) => {
+  const ctrl = await presentMoved(world);
+  const post = ctrl.posts.b;
+  const t0 = post.v.currentTime;
+  assert.ok(popup(world).doc.contains(post.v), 'the same element is now in the TV window');
+  assert.equal(world.tabs.get(world.session().playerTabId).url, 'about:blank', 'the TV did not load the feed again');
+  assert.equal([...world.tabs.values()].filter((t) => t.page && !t.popup).length, 1, 'no second copy of the page');
+  assert.ok(homeOf(ctrl, 'b').querySelector('[data-ytpm-home]'), 'a placeholder keeps its spot in the feed');
+  await until(() => tvWin(world)?.state === 'fullscreen', 3000, 'TV window fullscreen');
+  await until(() => ctrl.ioPauses >= 1, 1500, 'the feed paused it for being off-screen');
+  await sleep(800);
+  assert.equal(post.v.paused, false, 'played on after the feed paused it');
+  assert.ok(post.v.currentTime >= t0, 'carried on from the same position');
+  await until(() => ctrl.bar()?.title === 'Home / Feed' && !ctrl.bar().showsPaused, 2000, 'bar shows the TV playing');
+
+  ctrl.key('k');
+  await until(() => post.v.paused, 1500, 'paused from the remote');
+  await sleep(700);
+  assert.equal(post.v.paused, true, 'a pause from the remote is not undone');
+  await until(() => ctrl.bar().showsPaused, 1000, 'bar shows paused');
+  ctrl.key('k');
+  await until(() => !post.v.paused, 1500, 'playing again');
+  const t1 = post.v.currentTime;
+  ctrl.key('l');
+  await until(() => post.v.currentTime >= t1 + 9, 1500, '+10 s');
+  ctrl.key('ArrowDown');
+  await until(() => post.s.volume < 1, 1500, 'volume down');
+
+  // Another post starting on the Mac stays silent.
+  await ctrl.posts.a.v.play();
+  await until(() => ctrl.posts.a.v.paused || ctrl.posts.a.v.muted, 1500, 'other feed video held');
+
+  const tEnd = post.v.currentTime;
+  ctrl.barButton('End').click();
+  await until(() => !world.session() && world.playerWindows().length === 0 && !ctrl.bar(), 3000, 'ended, TV window closed');
+  assert.equal(post.v.parentElement, homeOf(ctrl, 'b'), 'video back in its spot');
+  assert.equal(homeOf(ctrl, 'b').querySelector('[data-ytpm-home]'), null, 'placeholder gone');
+  assert.equal(post.v.paused, true, 'parked, paused');
+  assert.ok(post.v.currentTime >= tEnd - 0.5, 'at the TV position');
+  assert.equal(post.v.hasAttribute('data-ytpm-moved'), false);
+  assert.equal(post.s.dead, undefined, 'still a working element');
+  noErrors(world);
+});
+
+test('move mode: closing the TV window puts the video back in the page first', async (world) => {
+  const ctrl = await presentMoved(world);
+  const post = ctrl.posts.b;
+  await sleep(800);
+  world.closeTab(world.session().playerTabId); // ⌘W on the TV
+  await until(() => !world.session() && !ctrl.bar(), 3000, 'ended');
+  assert.equal(post.v.parentElement, homeOf(ctrl, 'b'), 'video back in its spot');
+  assert.equal(post.s.dead, undefined, 'moved out before its window was destroyed');
+  assert.equal(post.v.paused, true, 'paused');
+  assert.match(ctrl.toast() || '', /TV window was closed/);
+  await post.v.play();
+  await sleep(300);
+  assert.equal(post.v.paused, false, 'plays again in the page');
+  noErrors(world);
+});
+
+test('move mode: cancelling the prompt starts nothing', async (world) => {
+  world.storage.local.settings = { moveVideo: true };
+  const ctrl = await world.openController(FEED);
+  await ctrl.posts.b.v.play();
+  await world.popupStart();
+  await until(() => ctrl.movePrompt('.no'), 2000, 'prompt');
+  ctrl.userClick(ctrl.movePrompt('.no'));
+  await sleep(800);
+  assert.equal(world.session(), null);
+  assert.equal(world.playerWindows().length, 0);
+  assert.equal(ctrl.posts.b.v.paused, false, 'still playing in the page');
+  assert.equal(ctrl.movePrompt(), null, 'prompt gone');
+  noErrors(world);
+});
+
+test('move mode: page hidden, timers throttled: the TV keeps playing and End still works', async (world) => {
+  const ctrl = await presentMoved(world);
+  const post = ctrl.posts.b;
+  await sleep(800);
+  world.setHidden(ctrl.tab.id, true);
+  const t0 = post.v.currentTime;
+  await sleep(6000);
+  assert.ok(post.v.currentTime > t0 + 5, `kept playing while hidden (${(post.v.currentTime - t0).toFixed(1)} s in 6 s)`);
+  assert.ok(world.bgEval('D.playback.maxGapMs') < 2600, 'reports kept coming, if slower');
+  world.shortcut(); // ⌥⇧P ends it from anywhere
+  await until(() => !world.session() && world.playerWindows().length === 0, 4000, 'ended while hidden');
+  await until(() => post.v.parentElement === homeOf(ctrl, 'b') && post.v.paused, 2000, 'video back, paused');
+  noErrors(world);
+});
+
+test('move mode: page hidden and its feeding stops: the TV stalls, the bar says why, it recovers', async (world) => {
+  const ctrl = await presentMoved(world);
+  const post = ctrl.posts.b;
+  await sleep(800);
+  world.setHidden(ctrl.tab.id, true);
+  await until(() => post.v.readyState === 2, 8000, 'TV ran out of video');
+  await until(() => /stuck/.test(ctrl.bar()?.warn || ''), 8000, 'bar warns that the TV is stuck');
+  assert.ok(world.bgEval('D.playback.stalls.length') > 0, 'diagnostics recorded the stall');
+  world.setHidden(ctrl.tab.id, false);
+  const t0 = post.v.currentTime;
+  await until(() => post.v.currentTime > t0 + 1, 3000, 'playing again once the page is visible');
+  await until(() => !ctrl.bar().warn, 3000, 'warning cleared');
+  noErrors(world);
+}, { hiddenFeeding: 'stops' });
+
+test('move mode: reloading the page ends it (a MediaSource video was fed by the page)', async (world) => {
+  const ctrl = await presentMoved(world);
+  const tabId = ctrl.tab.id;
+  await sleep(800);
+  world.navigateTab(tabId, FEED);
+  await until(() => world.tabs.get(tabId).page?.listener, 3000, 'page reloaded');
+  const page = () => world.tabs.get(tabId).page;
+  await until(() => !world.session() && world.playerWindows().length === 0, 5000, 'session ended, TV window closed');
+  await until(() => /stopped when this page reloaded/.test(page().toast() || ''), 3000, 'told why');
+  assert.equal(page().bar(), null, 'no remote bar');
+  noErrors(world);
+});
+
+test('move mode: a plain-file video survives a reload of the page', async (world) => {
+  const ctrl = await presentMoved(world, FEED + '?src=file');
+  const tabId = ctrl.tab.id;
+  const moved = ctrl.posts.b;
+  await sleep(800);
+  world.navigateTab(tabId, FEED + '?src=file');
+  await until(() => world.tabs.get(tabId).page?.listener, 3000, 'page reloaded');
+  const page = world.tabs.get(tabId).page;
+  await until(() => page.bar()?.title === 'Home / Feed', 5000, 'remote bar back, reporting');
+  await sleep(2000);
+  assert.ok(world.session()?.move, 'still presenting');
+  assert.equal(moved.v.paused, false, 'the TV kept playing');
+  await until(() => !page.bar().showsPaused, 2000, 'bar shows playing');
+  page.key('k');
+  await until(() => moved.v.paused, 2000, 'the reloaded page controls the TV');
+  page.barButton('End').click();
+  await until(() => !world.session() && world.playerWindows().length === 0 && !page.bar(), 3000, 'ended');
+  assert.equal(page.posts.b.v.paused, true, 'the page\'s new copy stays paused');
+  noErrors(world);
+});
+
+test('move mode: closing the page\'s tab closes the TV window', async (world) => {
+  const ctrl = await presentMoved(world);
+  await sleep(800);
+  world.closeTab(ctrl.tab.id);
+  await until(() => !world.session() && world.playerWindows().length === 0, 3000, 'TV window closed with it');
+  noErrors(world);
+});
+
+test('move mode: the TV display disconnects: pauses, and the Mac is not taken over', async (world) => {
+  const ctrl = await presentMoved(world);
+  await until(() => tvWin(world)?.state === 'fullscreen', 3000, 'fullscreen');
+  await sleep(1200);
+  world.disconnectTv();
+  await until(() => ctrl.posts.b.v.paused, 6000, 'paused');
+  await until(() => tvWin(world).state === 'normal', 3000, 'left fullscreen');
+  assert.match(ctrl.toast() || '', /disconnected/);
+  noErrors(world);
+});
+
+test('move mode: pausing with the site\'s own controls on the Mac is respected', async (world) => {
+  const ctrl = await presentMoved(world);
+  const post = ctrl.posts.b;
+  await sleep(6500); // past the moment the starting click still counts as activation
+  assert.equal(post.v.paused, false);
+  ctrl.userClick(homeOf(ctrl, 'b').querySelector('.site-play'));
+  await sleep(1000);
+  assert.equal(post.v.paused, true, 'stays paused');
+  await until(() => ctrl.bar().showsPaused, 1500, 'bar shows paused');
+  ctrl.key('k');
+  await until(() => !post.v.paused, 1500, 'the remote plays it again');
+  noErrors(world);
+});
+
+test('move mode: a browser that resets moved videos (Chromium): put back, ended with a reason', async (world) => {
+  world.storage.local.settings = { moveVideo: true };
+  const ctrl = await world.openController(FEED);
+  const post = ctrl.posts.b;
+  await post.v.play();
+  await sleep(1000);
+  await world.popupStart();
+  await until(() => ctrl.movePrompt(), 2000, 'prompt');
+  ctrl.userClick(ctrl.movePrompt());
+  await until(() => /restarted the video/.test(ctrl.toast() || ''), 5000, 'told why');
+  await until(() => !world.session() && world.playerWindows().length === 0 && !ctrl.bar(), 3000, 'ended');
+  assert.equal(post.v.parentElement, homeOf(ctrl, 'b'), 'video back in its spot');
+  noErrors(world);
+}, { resetOnAdopt: true });
+
+test('move mode: TV window found without tab titles or openers (lone blank popup)', async (world) => {
+  const ctrl = await presentMoved(world);
+  assert.equal(world.bgEval('D.placement.moveFoundBy'), 'blank');
+  ctrl.barButton('End').click();
+  await until(() => world.playerWindows().length === 0, 3000, 'ended');
+  noErrors(world);
+}, { tabTitles: false, openerIds: false });
+
+test('move mode with AirPlay video: the page opens as usual', async (world) => {
+  world.storage.local.settings = { moveVideo: true, mode: 'airplay' };
+  const ctrl = await world.openController(FEED);
+  await ctrl.posts.b.v.play();
+  await world.popupStart();
+  await until(() => world.session(), 3000, 'session');
+  assert.equal(world.session().move, false);
+  assert.equal(ctrl.movePrompt(), null, 'no move prompt');
+  await until(() => tv(world)?.overlayKind() === 'airplay', 4000, 'AirPlay prompt in a player window');
+  noErrors(world);
+});
+
+test('move mode is for other sites only: YouTube and Twitch still open their page', async (world) => {
+  world.storage.local.settings = { moveVideo: true };
+  await present(world);
+  assert.equal(world.session().move, false);
+  assert.match(world.tabs.get(world.session().playerTabId).url, /youtube\.com\/watch\?v=vidAlpha001/);
+  assert.equal(world.popups.size, 0, 'no popup opened by the page');
+  noErrors(world);
+});
+
 // ---- other modes ---------------------------------------------------------------------
 
 test('AirPlay mode: no fullscreen attempts, asks for the AirPlay click', async (world) => {

@@ -11,7 +11,8 @@
     "test:all": "npm test && npm run test:system",
     "check": "for f in extension/*.js extension/content/*.js; do node --check \"$f\" || exit 1; done",
     "icons": "swift scripts/make-icons.swift extension/icons",
-    "install:mac": "./scripts/install-mac-app.sh"
+    "install:mac": "./scripts/install-mac-app.sh",
+    "spike": "node spike/move-video/serve.mjs"
   },
   "devDependencies": {
     "jsdom": "^25.0.1"

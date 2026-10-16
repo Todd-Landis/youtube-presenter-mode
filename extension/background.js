@@ -6,7 +6,7 @@
 const ext = globalThis.browser ?? globalThis.chrome;
 const sessionStore = ext.storage.session ?? ext.storage.local;
 
-const DEFAULT_SETTINGS = { mode: 'extended', autoFullscreen: true, windowType: 'popup' };
+const DEFAULT_SETTINGS = { mode: 'extended', autoFullscreen: true, windowType: 'popup', moveVideo: false };
 // Same site, roughly: the last two labels of the host match (youtube.com and
 // consent.youtube.com; twitch.tv and clips.twitch.tv).
 function sameSite(a, b) {
@@ -112,6 +112,11 @@ const sameScreen = (a, b) => !!a && !!b && a.sw === b.sw && a.sh === b.sh && a.a
 const fillsScreen = (s) => !!s && s.iw >= s.sw - 2 && s.ih >= s.sh - 2;
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The tab whose content script plays the player role. In move mode the TV
+// window is a popup without a content script, and the controller tab, which
+// moved its own video into it, answers for it.
+const playerEnd = (s) => s.reporterTabId ?? s.playerTabId;
+
 function toTab(tabId, msg) {
   return ext.tabs.sendMessage(tabId, msg).catch(() => null);
 }
@@ -137,12 +142,12 @@ async function deliverCmd(s, cmd) {
   await loadDiag();
   // Keep order: once something is queued, later commands queue behind it.
   if (pendingCmds.length) return queueCmd(cmd, { action: cmd.action, error: 'queued behind an earlier command' });
-  let { r, error } = await sendToTab(s.playerTabId, cmd);
+  let { r, error } = await sendToTab(playerEnd(s), cmd);
   if (r && !r.notReady) { D.commands.direct++; return r; }
   // One quick retry; the player ignores a command ID it has already run.
   await delay(150);
   const firstError = r?.notReady ? 'player still loading' : error;
-  ({ r, error } = await sendToTab(s.playerTabId, cmd));
+  ({ r, error } = await sendToTab(playerEnd(s), cmd));
   if (r && !r.notReady) { D.commands.retried++; return r; }
   return queueCmd(cmd, {
     action: cmd.action, error: firstError, retryError: r?.notReady ? 'player still loading' : error,
@@ -197,27 +202,47 @@ async function doStart(msg, tab) {
   if (!/^https?:\/\//i.test(msg.url || '')) return { ok: false, error: 'nothing to open on the TV' };
   const url = msg.url;
   await setPresence({ starting: Date.now() });
-  const attempts = [
-    { url, ...bounds, type: settings.windowType, focused: settings.mode === 'airplay' },
-    { url, ...bounds },
-    { url },
-  ];
   let win = null;
+  let playerTab = null;
+  let movedFoundBy = null;
+  let movedSeen = null;
   const errors = [];
-  for (const opts of attempts) {
-    try {
-      win = await ext.windows.create(opts);
-      break;
-    } catch (e) {
-      errors.push({ opts: { ...opts, url: undefined }, error: String(e?.message || e) });
+  if (msg.move) {
+    // Move mode: the controller opened the TV window itself, so that it could
+    // move its own <video> into it. Find that window, then place it.
+    const found = await findMovedWindow(tab, msg.marker);
+    if (!found) {
+      await setPresence(null);
+      return { ok: false, error: "couldn't find the TV window the page opened" };
     }
+    ({ win, tab: playerTab, by: movedFoundBy, seen: movedSeen } = found);
+    if (Math.abs(win.left - bounds.left) > 40 || Math.abs(win.top - bounds.top) > 40) {
+      try {
+        win = await ext.windows.update(win.id, bounds);
+      } catch (e) {
+        errors.push({ opts: { update: bounds }, error: String(e?.message || e) });
+      }
+    }
+  } else {
+    const attempts = [
+      { url, ...bounds, type: settings.windowType, focused: settings.mode === 'airplay' },
+      { url, ...bounds },
+      { url },
+    ];
+    for (const opts of attempts) {
+      try {
+        win = await ext.windows.create(opts);
+        break;
+      } catch (e) {
+        errors.push({ opts: { ...opts, url: undefined }, error: String(e?.message || e) });
+      }
+    }
+    if (!win) {
+      await setPresence(null);
+      return { ok: false, error: 'windows.create failed: ' + errors.map((e) => e.error).join('; ') };
+    }
+    playerTab = win.tabs?.[0] ?? (await ext.tabs.query({ windowId: win.id }))[0];
   }
-  if (!win) {
-    await setPresence(null);
-    return { ok: false, error: 'windows.create failed: ' + errors.map((e) => e.error).join('; ') };
-  }
-
-  const playerTab = win.tabs?.[0] ?? (await ext.tabs.query({ windowId: win.id }))[0];
   S = {
     id: Math.random().toString(36).slice(2, 10),
     mode: settings.mode,
@@ -230,6 +255,9 @@ async function doStart(msg, tab) {
     controllerWindowId: tab.windowId,
     playerTabId: playerTab.id,
     playerWindowId: win.id,
+    move: !!msg.move,
+    moveName: msg.move ? msg.moveName : null,
+    reporterTabId: msg.move ? tab.id : undefined,
     ctrlScreen: ctrl,
     startedAt: Date.now(),
     onOther: false,
@@ -259,8 +287,12 @@ async function doStart(msg, tab) {
     created: pickWin(win),
     controllerScreen: ctrl,
     rememberedBoundsUsed: !!tvBounds && settings.mode !== 'airplay',
+    move: !!msg.move,
+    moveFoundBy: movedFoundBy,
+    // What Safari reported about the other windows' tabs (title, opener).
+    moveSeen: movedSeen,
   };
-  log('bg', 'session started', { mode: settings.mode, site: msg.site, key: msg.key, t: msg.t });
+  log('bg', 'session started', { mode: settings.mode, site: msg.site, key: msg.key, t: msg.t, move: !!msg.move });
   // Where did Safari actually put it? If it ignored the position, move it.
   delay(1500).then(async () => {
     try {
@@ -278,13 +310,37 @@ async function doStart(msg, tab) {
   return { ok: true, session: S };
 }
 
+// Move mode: find the popup the controller opened. By the title it gave the
+// window, else by opener, else the one new blank popup.
+async function findMovedWindow(tab, marker) {
+  const blank = (t) => !t.url || t.url === 'about:blank';
+  let seen = [];
+  for (let i = 0; i < 20; i++) {
+    let wins = [];
+    try { wins = await ext.windows.getAll({ populate: true }); } catch {}
+    const tabs = wins.filter((w) => w.id !== tab.windowId).flatMap((w) => (w.tabs || []).map((t) => ({ win: w, tab: t })));
+    seen = tabs.map(({ win: w, tab: t }) => ({ win: w.id, type: w.type, url: t.url, title: t.title, opener: t.openerTabId }));
+    const byTitle = marker && tabs.find(({ tab: t }) => t.title === marker);
+    if (byTitle) return { ...byTitle, by: 'title', seen };
+    const byOpener = tabs.find(({ tab: t }) => t.openerTabId === tab.id && blank(t));
+    if (byOpener) return { ...byOpener, by: 'opener', seen };
+    const lone = tabs.filter(({ win: w, tab: t }) => blank(t) && (w.tabs || []).length === 1);
+    if (lone.length === 1 && i >= 2) return { ...lone[0], by: 'blank', seen };
+    await delay(150);
+  }
+  await loadDiag();
+  log('bg', 'move mode: TV window not found', { marker, seen });
+  return null;
+}
+
 async function endSession(reason, { waitForStart = true } = {}) {
   if (waitForStart && startLock) await startLock.catch(() => {});
   const s = await loadSession();
   if (!s) return { ok: true, final: lastState };
   let final = lastState;
   if (reason !== 'player-closed') {
-    const fresh = await toTab(s.playerTabId, { type: 'getState' });
+    // Move mode: the controller also puts its video back before the window closes.
+    const fresh = await toTab(playerEnd(s), { type: 'getState', release: !!s.move });
     if (fresh && typeof fresh.t === 'number') final = fresh;
   }
   S = null;
@@ -454,14 +510,14 @@ async function tryWindowFullscreen(trigger, toNormal = false, { focus = false, q
   if (focus) ext.windows.update(s.controllerWindowId, { focused: true }).catch(() => {});
   try { r.windowStateAfter = (await ext.windows.get(s.playerWindowId)).state; } catch {}
   // Ask the player directly; the last relayed state can be stale.
-  const fresh = await toTab(s.playerTabId, { type: 'getState' });
+  const fresh = await toTab(playerEnd(s), { type: 'getState' });
   const fills = fillsScreen((fresh ?? lastState)?.screen) || !!fresh?.fs;
   r.playerFillsScreenAfter = fills;
   r.ok = toNormal ? !fills : fills;
   D.placement.windowFullscreen = r;
   log('bg', 'window ' + r.target + (r.ok ? ' worked' : ' did not take'), r);
   if (!toNormal && !fills && !quiet) {
-    toTab(s.playerTabId, { type: 'needFullscreenClick' });
+    toTab(playerEnd(s), { type: 'needFullscreenClick' });
     toTab(s.controllerTabId, { type: 'event', name: 'fullscreen-needs-click' });
   }
   return r;
@@ -469,7 +525,7 @@ async function tryWindowFullscreen(trigger, toNormal = false, { focus = false, q
 
 async function onPlayerState(state, sender) {
   const s = await loadSession();
-  if (!s || sender.tab?.id !== s.playerTabId) return { ok: false, stale: true };
+  if (!s || sender.tab?.id !== playerEnd(s)) return { ok: false, stale: true };
   await loadDiag();
   lastState = state;
   heartbeat(state);
@@ -507,7 +563,7 @@ async function onPlayerEvent(msg, sender) {
   }
   if (msg.name === 'selftest') D.controls.selftest = msg.data;
   log('player', msg.name, msg.data);
-  if (msg.notify && S && sender.tab?.id === S.playerTabId) {
+  if (msg.notify && S && sender.tab?.id === playerEnd(S)) {
     toTab(S.controllerTabId, { type: 'event', name: msg.name, data: msg.data });
   }
   return { ok: true };
@@ -606,7 +662,7 @@ async function handle(msg, sender) {
     case 'diag:selftest': {
       const s = await loadSession();
       if (!s) return { ok: false, error: 'Start presenter mode first.' };
-      return (await toTab(s.playerTabId, { type: 'selftest' })) ?? { ok: false, error: 'player window did not answer' };
+      return (await toTab(playerEnd(s), { type: 'selftest' })) ?? { ok: false, error: 'player window did not answer' };
     }
     case 'diag:forgetTv':
       await ext.storage.local.remove('tvBounds');
@@ -631,11 +687,18 @@ ext.tabs.onRemoved.addListener(async (tabId) => {
   if (tabId === s.playerTabId) {
     await endSession('player-closed');
   } else if (tabId === s.controllerTabId) {
-    // Leave the player running as a normal YouTube window.
     S = null;
     await saveSession();
-    toTab(s.playerTabId, { type: 'orphaned' });
-    log('bg', 'controller tab closed; player window released');
+    if (s.move) {
+      // Move mode: the video in the TV window belonged to that tab, which
+      // drove it (and, with MediaSource, fed it). Nothing is left to show.
+      try { await ext.windows.remove(s.playerWindowId); } catch {}
+      log('bg', 'controller tab closed; closed the TV window (move mode)');
+    } else {
+      // Leave the player running as a normal page.
+      toTab(s.playerTabId, { type: 'orphaned' });
+      log('bg', 'controller tab closed; player window released');
+    }
   }
 });
 

@@ -134,16 +134,17 @@ var YTPM = globalThis.YTPM || (globalThis.YTPM = {});
     return best;
   };
 
-  // What this window can tell about the display it is on. Safari exposes the
-  // non-standard availLeft/availTop, which identify the screen's origin.
-  YTPM.screenInfo = () => ({
-    sx: window.screenX, sy: window.screenY,
-    sw: screen.width, sh: screen.height,
-    al: screen.availLeft ?? null, at: screen.availTop ?? null,
-    aw: screen.availWidth, ah: screen.availHeight,
-    iw: window.innerWidth, ih: window.innerHeight,
-    ow: window.outerWidth, oh: window.outerHeight,
-    dpr: window.devicePixelRatio,
+  // What a window (this one, or a popup it opened) can tell about the display
+  // it is on. Safari exposes the non-standard availLeft/availTop, which
+  // identify the screen's origin.
+  YTPM.screenInfo = (w = window) => ({
+    sx: w.screenX, sy: w.screenY,
+    sw: w.screen.width, sh: w.screen.height,
+    al: w.screen.availLeft ?? null, at: w.screen.availTop ?? null,
+    aw: w.screen.availWidth, ah: w.screen.availHeight,
+    iw: w.innerWidth, ih: w.innerHeight,
+    ow: w.outerWidth, oh: w.outerHeight,
+    dpr: w.devicePixelRatio,
   });
 
   YTPM.sameScreen = (a, b) =>

@@ -7,7 +7,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 
 const root = fileURLToPath(new URL('../extension/', import.meta.url));
 const files = ['content/page-bridge.js', 'content/common.js', 'content/sites/youtube.js', 'content/sites/twitch.js',
-  'content/sites/generic.js', 'content/player.js', 'content/controller.js', 'content/boot.js'];
+  'content/sites/generic.js', 'content/player.js', 'content/move.js', 'content/controller.js', 'content/boot.js'];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const HTML = `<!doctype html><html><head><title>Test Video - YouTube</title></head><body>

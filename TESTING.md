@@ -5,7 +5,8 @@ Three layers, from fast to thorough:
 | Command | What it covers | Time |
 |---|---|---|
 | `npm test` | Unit tests: background logic against mocked extension APIs, content scripts in jsdom | ~10 s |
-| `npm run test:system` | 43 end-to-end scenarios plus a fuzzer, against simulated Safari, YouTube, Twitch and a generic site | ~5 min |
+| `npm run test:system` | 57 end-to-end scenarios (three of them fuzzer runs), against simulated Safari, YouTube, Twitch, a generic site and a feed | ~6 min |
+| `npm run spike` | Move-mode spike: what Safari does with a `<video>` moved into another window ([below](#move-mode)) | ~5 min, by hand |
 | Manual checklist below | The things only real Safari and a real Apple TV can show | ~10 min |
 
 ## The system harness
@@ -15,6 +16,7 @@ Three layers, from fast to thorough:
   - **YouTube**, with Shorts and live and broken videos
   - **Twitch**, modelled on the real page: a transformed ancestor around the player, `data-a-target` controls, live channels, VODs, clips and a mature-content gate
   - **a generic site**, with a muted looping hero video as a decoy and the real player nested under transformed containers
+  - **a feed** (for move mode): three posts with their own players at one address. Their MediaSource videos only play what the page's script has appended, a few seconds ahead, topped up on the page's timers (`?src=file` makes them plain files instead). Like an IntersectionObserver, the feed pauses a video once it has left the page
 - They're wired through a simulated Safari extension layer that can be made to misbehave:
   - drop or delay messages in either direction, or lose replies
   - unload the background page mid-session (in-memory state lost, storage kept)
@@ -24,6 +26,7 @@ Three layers, from fast to thorough:
   - toggle a window back out of fullscreen if fullscreen is requested again
   - fail to load the page-world bridge, as Safari ignores the manifest's `world` key
   - close tabs, reload pages, disconnect the TV display, or have the user leave fullscreen
+  - for move mode: `window.open` popups that need a click (Safari's pop-up blocker) but can be found again by name without one, about:blank popups with no content script whose document the opener scripts, `navigator.userActivation`, hidden pages whose timers fire at most once a second (optionally with the feed's feeding stopping), a closed popup destroying any video still in it, Chromium's reset of a media element moved to another document, and tab titles or opener IDs not being reported
 
 `tests/system.test.mjs` holds the scenarios. Each one describes the expected behaviour, so a failure is a real regression.
 
@@ -120,6 +123,45 @@ Problems that came up while generalising, and what was done about them:
 | The TV's own prompts would sit under a top-layer player | Prompts go in the top layer too, above it |
 | The controller was dropped when its tab left YouTube | Its content script runs everywhere now, so it stays the controller; only the TV leaving the session's site ends it |
 
+## Move mode
+
+Move mode (experimental, sites other than YouTube and Twitch, off by default) is for feeds, where reopening the page's address on the TV shows some other video. The page opens a popup with `window.open` and moves its own `<video>` element into it. The background finds that window, puts it on the TV and makes it fullscreen. The page's scripts keep driving the element, so the stream, position and ad state carry over. The popup has no content script, so the controller tab answers for it: it reports the popup's screen and the video's state, and runs the remote's commands on the element.
+
+### Edge cases
+
+| Situation | What happens | Scenario |
+|---|---|---|
+| Started from the toolbar or ⌥⇧P, so there's no click on the page and Safari would block the popup | The page asks "Move this video to the TV?"; the click on **Move to TV** opens the window. Cancel (or 30 s) starts nothing | cancelling the prompt |
+| The feed pauses the video once it's no longer on its page (IntersectionObserver), within moments of the move | Played on, even before the background has confirmed the session; at most four times a minute | the feed's own video moves to the TV |
+| The user pauses with the site's own controls on the Mac | Respected (user activation, once the starting click's activation has expired); the remote shows paused | pausing with the site's own controls |
+| A pause from the remote | Not undone by the play-on rule | the feed's own video moves to the TV |
+| The page is hidden; Safari runs its timers once a second | The TV keeps playing; reports keep coming, slower; End (⌥⇧P) still works | page hidden, timers throttled |
+| The page is hidden and its MediaSource feeding stops | The TV runs dry. Reports flag it after 3 s, the bar says the TV is stuck and why, diagnostics record a stall, and playback resumes once the page is visible | page hidden and its feeding stops |
+| The page reloads, MediaSource video | Nothing feeds that stream any more. The reloaded page finds the TV window by name, sees a `blob:` source, ends presenter mode, closes the window and says why | reloading the page ends it |
+| The page reloads, plain-file video | The reloaded page finds the window by name, checks the video is still advancing, and takes over the remote | a plain-file video survives a reload |
+| The page's tab closes | The TV window closes too | closing the page's tab |
+| The TV window is closed (⌘W, or End) | On the popup's `pagehide`, the video moves back into its spot before the window's document is destroyed. It's paused and still works | closing the TV window; the feed's own video … End |
+| The TV display disconnects | Paused, out of fullscreen, as in normal mode | the TV display disconnects |
+| The browser restarts a moved element (Chromium does) | An `emptied` or `error` within 3 s of the move: the video goes back, presenter mode ends, and the remote says move mode can't work here | a browser that resets moved videos |
+| Safari doesn't report the popup's tab title or opener | The background takes the one new blank popup | TV window found without tab titles or openers |
+| YouTube or Twitch with move mode on | Unchanged: the TV opens their page | move mode is for other sites only |
+
+The popup inherits the page's Content Security Policy, so it gets no `<style>` element or script: everything is styled through CSSOM (`style.setProperty(…, 'important')`, re-applied with every report in case the site rewrites the element's inline style).
+
+### The spike
+
+`npm run spike` serves `spike/move-video/` on http://localhost:8642/ and generates its media on first run (`scripts/make-spike-media.swift`: a progressive MP4, and a fragmented MP4 that the page appends through MediaSource in 64 KB pieces on a 250 ms timer, like a small player). Each frame shows the playback time over a moving bar, with a beep every second. In Safari:
+
+1. **Run automatic checks.** This opens the popup from the click and starts both videos. Each one is moved in, controlled from the page (pause, play with sound without a click, seek, volume), moved back, and moved in again. The page records whether it kept playing, whether the move reset it, whether there's a picture (a frame drawn to a canvas), and any media error.
+2. **Hidden:** switch tabs, or cover the window, for a minute. The page records how far each video got, any stalls, and how often its own timers ran.
+3. **Reload:** ⌘R. The page tries to find the popup by name without a click, and records whether each video kept playing through the reload.
+4. **Close:** close the tab. The popup's own status panel (a script running in the popup) shows which video still plays. **Copy** copies it.
+
+| Browser | Plain MP4 moved | MediaSource moved | Notes |
+|---|---|---|---|
+| Chromium (dry run in an embedded browser, popup simulated by a same-origin iframe) | Restarts from 0 (`emptied`) | Errors (code 4); the page's SourceBuffer is detached | Chromium re-runs the media load algorithm when an element changes document, so move mode can't work there |
+| Safari 26 | To be checked | To be checked | |
+
 ## What the simulation can't prove
 
 The harness models Safari as closely as I could. Real Safari still decides these, so they need the manual check:
@@ -129,6 +171,7 @@ The harness models Safari as closely as I could. Real Safari still decides these
 - YouTube's real markup, which can change. Checked against the live site: the play button's "Pause"/"Play" label, Shorts using `#shorts-player`, `loadVideoById` leaving the page URL unchanged, live durations, and error codes
 - Twitch's real behaviour beyond what was checked live (VOD `?t=` handling, captions on streams that have them, the mature-content gate's button)
 - generic sites vary endlessly: lazy players, iframes, players that re-create their video element
+- move mode: whether WebKit keeps a moved `<video>` playing (plain file and MediaSource), with a picture; whether Safari reports the popup's tab title or opener; whether a page can find its popup by name after a reload without a click; how hard Safari throttles a hidden tab's timers and whether real feeds' players keep up; what real feeds do to a video that has left their page. The spike answers the first questions; the rest needs real feeds
 
 An occasional "script error" in earlier runs turned out to be the harness itself. A test's closed pages kept running briefly (jsdom doesn't stop them), and their errors were reported to the next test, which didn't know those pages were closed. The list of closed pages is now shared by every test.
 
@@ -150,5 +193,6 @@ After `npm run install:mac`, close any old TV window and reload YouTube tabs. Th
 12. **Twitch:** on a live channel, start from the button next to Twitch's fullscreen button. The TV shows only the stream; the bar shows LIVE. Switch channel on the Mac: the TV follows and stays fullscreen. Type in chat: nothing reaches the TV.
 13. **Twitch VOD:** start partway into a past broadcast. The TV starts at the same point; J/L seek.
 14. **Any site:** on a page with a video (a news site or Vimeo, say), press ⌥⇧P. The TV opens the page with just that video filling the screen, from the Mac's position. Allow the extension on that site if Safari asks.
+15. **Move mode:** turn it on in the toolbar popup. In a feed (X, Reddit or Instagram), play a post's video with sound, press ⌥⇧P and click **Move to TV**. The same video carries on, fullscreen on the TV, with a placeholder in the feed. Try the remote, then switch tabs for a minute, then End: the video is back in the feed, paused. Diagnostics ▸ Copy report includes how the TV window was found (`placement.moveFoundBy`) and any `move-…` events.
 
 If anything misbehaves: Toolbar ▸ Diagnostics ▸ **Copy report**.

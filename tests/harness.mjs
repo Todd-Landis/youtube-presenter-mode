@@ -3,6 +3,9 @@
 // knobs for the failures seen (or feared) in real Safari: dropped or delayed
 // messages, a background page that gets unloaded, fullscreen requests that are
 // ignored, tabs that close or reload, and a TV display that disconnects.
+// For move mode it also models window.open popups, user activation, hidden
+// pages (throttled timers) and a feed whose MediaSource videos are fed by the
+// page's own script.
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +17,7 @@ const SRC = {
   background: read('background.js'),
   bridge: read('content/page-bridge.js'),
   content: ['content/common.js', 'content/sites/youtube.js', 'content/sites/twitch.js', 'content/sites/generic.js',
-    'content/player.js', 'content/controller.js', 'content/boot.js'].map(read).join('\n'),
+    'content/player.js', 'content/move.js', 'content/controller.js', 'content/boot.js'].map(read).join('\n'),
 };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -56,6 +59,11 @@ export const CATALOG = {
   'gen:/films/two': { title: 'Film two', d: 180 },
   'gen:/live': { title: 'Live cam', live: true },
   'gen:/no-video': { title: 'Just text', none: true },
+  // A feed: the address doesn't say which video you're watching.
+  'gen:/feed': { title: 'Home / Feed', feed: true },
+  'post:a': { title: '', d: 60 },
+  'post:b': { title: '', d: 95 },
+  'post:c': { title: '', d: 40 },
   hero: { title: '', d: 1e9, muted: true },
 };
 const NEXT = { vidAlpha001: 'vidBravo002', vidBravo002: 'vidCharl003', vidCharl003: 'vidAlpha001' };
@@ -112,6 +120,13 @@ export class World {
       aboutBlank: true, // new windows report about:blank before the real URL
       popupType: true, // windows.create accepts type: 'popup'
       misplace: false, // Safari ignores left/top on create
+      popups: 'block', // window.open without a click: 'block' | 'allow'
+      tabTitles: true, // tabs.Tab.title is reported (also for about:blank popups)
+      openerIds: true, // tabs.Tab.openerTabId is reported
+      hiddenTimerMs: 1000, // a hidden page's timers fire at most this often
+      hiddenFeeding: 'throttled', // a hidden feed page's MediaSource feeding: 'throttled' | 'stops'
+      feedPausesOffscreen: true, // the feed pauses a video that has left its page (IntersectionObserver)
+      resetOnAdopt: false, // a media element moved to another document starts over (Chromium)
       ...opts,
     };
     this.rand = rng(this.o.seed);
@@ -123,6 +138,7 @@ export class World {
     this.focusLog = [];
     this.bgGen = 0;
     this.tvConnected = true;
+    this.popups = new Set();
     // jsdom keeps running a page's pending code after it closes (a real
     // browser stops it), so errors from closed pages are not counted. Page
     // names are unique per process, and a previous test's closed pages can
@@ -210,6 +226,7 @@ export class World {
           if (!win) throw new Error('No window with id: ' + id);
           return w.winInfo(win);
         },
+        getAll: async () => [...w.windows.values()].map((win) => w.winInfo(win)),
         update: (id, o) => w.updateWindow(id, o),
         remove: (id) => w.removeWindow(id),
       },
@@ -273,7 +290,12 @@ export class World {
   }
 
   tabInfo(t) {
-    return { id: t.id, windowId: t.windowId, url: t.url, active: t === this.activeTab };
+    const info = { id: t.id, windowId: t.windowId, url: t.url, active: t === this.activeTab };
+    if (this.o.tabTitles) {
+      try { info.title = (t.popup ? t.popup.doc : t.page?.doc)?.title ?? ''; } catch { info.title = ''; }
+    }
+    if (this.o.openerIds && t.openerTabId != null) info.openerTabId = t.openerTabId;
+    return info;
   }
 
   winInfo(win) {
@@ -395,6 +417,14 @@ export class World {
     }, 120);
   }
 
+  // The tab's window is covered, minimised, or another tab is in front.
+  setHidden(tabId, hidden) {
+    const page = this.tabs.get(tabId)?.page;
+    if (!page || page.closed) return;
+    page.hidden = hidden;
+    page.doc.dispatchEvent(new page.win.Event('visibilitychange'));
+  }
+
   // ⌃⌘F / Esc on the TV.
   userExitFullscreen(winId) {
     this.setFullscreen(this.windows.get(winId), false);
@@ -409,8 +439,9 @@ export class World {
     }
   }
 
+  // TV windows: opened by the extension, or (move mode) by a page.
   playerWindows() {
-    return [...this.windows.values()].filter((w) => w.byExtension);
+    return [...this.windows.values()].filter((w) => w.byExtension || w.byPage);
   }
 
   // Messages that reached the background, by type (for "idle pages stay quiet").
@@ -469,6 +500,15 @@ ${none ? '<p>No video here.</p>' : '<div class="wrap"><video class="main"></vide
 <textarea id="comment"></textarea>
 </body></html>`;
 
+// A feed (X, Reddit, Instagram style): several posts with their own players.
+const FEED_HTML = (title) => `<!doctype html><html><head><title>${title}</title></head><body>
+<header><input id="search" type="text"></header>
+<main class="feed">${['a', 'b', 'c'].map((p) => `
+<article data-post="${p}"><div class="media" style="position:relative${p === 'b' ? ';transform:translateZ(0)' : ''}">
+<video data-key="post:${p}"></video><div class="site-controls"><button class="site-play">Play</button></div>
+</div></article>`).join('')}
+</main></body></html>`;
+
 class Page {
   constructor(world, tab, url) {
     this.world = world;
@@ -479,6 +519,8 @@ class Page {
     this.gestureUntil = 0;
     this.closed = false;
     this.timers = [];
+    this.onClose = [];
+    this.hidden = false;
     this.autoplayNext = true;
 
     const vc = new VirtualConsole();
@@ -491,7 +533,8 @@ class Page {
     const meta = CATALOG[id] || { title: 'Unknown', d: 100 };
     this.site = siteOf(url);
     const html = this.site === 'youtube' ? PAGE_HTML(meta.title)
-      : this.site === 'twitch' ? TWITCH_HTML(meta.title, meta.gate) : GENERIC_HTML(meta.title, meta.none);
+      : this.site === 'twitch' ? TWITCH_HTML(meta.title, meta.gate)
+        : meta.feed ? FEED_HTML(meta.title) : GENERIC_HTML(meta.title, meta.none);
     this.dom = new JSDOM(html, { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole: vc });
     const w = (this.win = this.dom.window);
     this.doc = w.document;
@@ -500,7 +543,18 @@ class Page {
     });
     this.installScreen();
     this.installFullscreenApi();
-    if (this.site === 'youtube') {
+    this.installTimers();
+    this.installVisibility();
+    this.installWindowOpen();
+    if (meta.feed) {
+      // ?src=file: the posts are plain video files instead of MediaSource streams.
+      const src = new URL(url).searchParams.get('src') === 'file' ? 'file' : 'mse';
+      this.posts = {};
+      for (const art of this.doc.querySelectorAll('article')) {
+        const v = art.querySelector('video');
+        this.posts[art.dataset.post] = this.installPlayer(art.querySelector('.media'), { id: v.dataset.key, autoplay: false, videoEl: v, feed: true, src });
+      }
+    } else if (this.site === 'youtube') {
       this.yt = this.installPlayer(this.doc.getElementById('movie_player'), { id, autoplay: true, api: true });
       if (url.includes('/shorts/')) this.addShortsPlayer(id);
     } else if (this.site === 'twitch') {
@@ -529,6 +583,9 @@ class Page {
 
   close() {
     if (this.closed) return;
+    // This page's script dies with it, including listeners it put on popups.
+    for (const pop of this.world.popups) pop.listeners = pop.listeners.filter((l) => !(l.fn instanceof this.win.Function));
+    this.onClose.forEach((f) => f());
     this.closed = true;
     this.world.closedPages.add(this.name);
     this.listener = null;
@@ -550,6 +607,54 @@ class Page {
 
   fire(type) {
     if (!this.closed) this.win.dispatchEvent(new this.win.Event(type));
+  }
+
+  // ---- hidden pages: WebKit fires a hidden page's timers at most once a second ----
+  installTimers() {
+    const w = this.win;
+    const page = this;
+    const st = w.setTimeout.bind(w);
+    const ct = w.clearTimeout.bind(w);
+    const delayFor = (ms) => (page.hidden ? Math.max(ms || 0, page.world.o.hiddenTimerMs) : ms);
+    w.setTimeout = (f, ms, ...a) => st(f, delayFor(ms), ...a);
+    const intervals = new Map();
+    let nextId = 1e6;
+    w.setInterval = (f, ms, ...a) => {
+      const id = ++nextId;
+      const tick = () => {
+        intervals.set(id, st(tick, delayFor(ms)));
+        f(...a);
+      };
+      intervals.set(id, st(tick, delayFor(ms)));
+      return id;
+    };
+    w.clearInterval = (id) => {
+      if (!intervals.has(id)) return ct(id);
+      ct(intervals.get(id));
+      intervals.delete(id);
+    };
+  }
+
+  installVisibility() {
+    const page = this;
+    Object.defineProperty(this.doc, 'visibilityState', { configurable: true, get: () => (page.hidden ? 'hidden' : 'visible') });
+    Object.defineProperty(this.doc, 'hidden', { configurable: true, get: () => page.hidden });
+  }
+
+  // window.open: Safari blocks a new popup without a click (unless allowed for
+  // the site), but lets a page reach a window it already opened by name.
+  installWindowOpen() {
+    const page = this;
+    Object.defineProperty(this.win.navigator, 'userActivation', {
+      configurable: true,
+      value: { get isActive() { return Date.now() < page.gestureUntil; }, get hasBeenActive() { return page.gestureUntil > 0; } },
+    });
+    this.win.open = (url, name, features) => {
+      const existing = name && [...page.world.popups].find((p) => p.name === name && !p.closed && p.tab.openerTabId === page.tab.id);
+      if (existing) return existing.proxy;
+      if (Date.now() >= page.gestureUntil && page.world.o.popups !== 'allow') return null;
+      return new Popup(page.world, page, name || '', features).proxy;
+    };
   }
 
   // ---- window geometry follows the simulated window/screen ----
@@ -599,18 +704,24 @@ class Page {
 
   // ---- a fake player: a simulated <video>, plus YouTube's #movie_player API
   // (api) or Twitch-style controls ----
-  installPlayer(container, { id, autoplay, api = false, videoEl = null }) {
+  installPlayer(container, { id, autoplay, api = false, videoEl = null, feed = false, src = 'mse' }) {
     const page = this;
     const w = this.win;
     const v = videoEl || container.querySelector('video');
     const s = { id, paused: true, ended: false, t: 0, rate: 1, volume: 1, muted: !!CATALOG[id]?.muted, cc: false, ccAvail: true, since: Date.now() };
     const meta = () => CATALOG[s.id] || { title: 'Unknown', d: 100 };
     const ev = (type) => v.dispatchEvent(new w.Event(type));
-    const now = () => {
+    // Feed posts with MediaSource only play what the page's script has
+    // appended: a few seconds ahead, topped up on the page's timers.
+    const fed = feed && src === 'mse';
+    const AHEAD = 4;
+    s.bufferedTo = AHEAD;
+    const rawNow = () => {
       if (s.paused) return s.t;
       const t = s.t + ((Date.now() - s.since) / 1000) * s.rate;
       return meta().live ? t : Math.min(t, meta().d);
     };
+    const now = () => (fed && !s.paused ? Math.min(rawNow(), s.bufferedTo) : rawNow());
     const settle = () => { s.t = now(); s.since = Date.now(); };
     const setBtn = () => {
       const b = container.querySelector('.ytp-play-button');
@@ -623,16 +734,31 @@ class Page {
     const def = (k, get, set) => Object.defineProperty(v, k, { configurable: true, get, set });
     def('paused', () => s.paused);
     def('ended', () => s.ended);
-    def('currentTime', now, (t) => { settle(); s.t = Math.max(0, meta().live ? t : Math.min(t, meta().d)); s.ended = false; ev('seeking'); setTimeout(() => ev('seeked'), 5); });
+    def('currentTime', now, (t) => {
+      settle();
+      s.t = Math.max(0, meta().live ? t : Math.min(t, meta().d));
+      s.ended = false;
+      if (fed) s.bufferedTo = s.t; // nothing buffered at the new spot yet
+      ev('seeking');
+      setTimeout(() => ev('seeked'), 5);
+    });
     def('duration', () => (meta().error ? NaN : meta().live ? Infinity : meta().d));
     def('playbackRate', () => s.rate, (r) => { settle(); s.rate = r; ev('ratechange'); });
     def('volume', () => s.volume, (x) => { s.volume = x; ev('volumechange'); });
     def('muted', () => s.muted, (m) => { s.muted = m; ev('volumechange'); });
-    def('readyState', () => (meta().error ? 0 : 4));
-    def('currentSrc', () => 'blob:https://example/' + s.id);
+    def('readyState', () => (meta().error || s.dead ? 0 : fed && !s.paused && rawNow() >= s.bufferedTo ? 2 : 4));
+    def('currentSrc', () => (src === 'file' ? 'https://videos.example.com/media/' + s.id.replace(':', '-') + '.mp4' : 'blob:https://example/' + s.id));
+    // The document holding it was destroyed (a closed popup): it stops for good.
+    v.__kill = () => {
+      if (s.dead) return;
+      settle();
+      s.paused = true;
+      s.dead = true;
+    };
+    if (feed) def('error', () => (s.dead ? { code: 4 } : null));
     v.getVideoPlaybackQuality = () => ({ droppedVideoFrames: 0, totalVideoFrames: Math.floor(now() * 30) });
     v.play = async () => {
-      if (meta().error) throw new w.DOMException('No source', 'NotSupportedError');
+      if (meta().error || s.dead) throw new w.DOMException('No source', 'NotSupportedError');
       if (meta().gate && !page.gateAccepted) return; // Twitch holds playback behind the gate
       const allowed = s.muted || page.world.o.autoplay || page.unlocked || Date.now() < page.gestureUntil;
       if (!allowed) throw new w.DOMException('play() requires a user gesture', 'NotAllowedError');
@@ -695,6 +821,49 @@ class Page {
       loadVideoById: (o) => load(typeof o === 'string' ? o : o.videoId, (o && o.startSeconds) || 0),
       nextVideo: () => page.spaNavigate('/watch?v=' + (NEXT[s.id] || 'vidAlpha001')),
     });
+    if (feed) {
+      // The page's MediaSource feeding, on its own (throttle-able) timers.
+      const feedTick = () => {
+        if (page.closed || s.dead) return;
+        if (fed && !(page.hidden && page.world.o.hiddenFeeding === 'stops')) {
+          if (!s.paused && rawNow() > s.bufferedTo) {
+            // It ran dry: carry on from where it stopped.
+            s.t = s.bufferedTo;
+            s.since = Date.now();
+          }
+          s.bufferedTo = Math.max(s.bufferedTo, now() + AHEAD);
+        }
+        page.win.setTimeout(feedTick, 250);
+      };
+      feedTick();
+      s.doc = v.ownerDocument;
+      page.every(50, () => {
+        // Moved into another document.
+        if (v.ownerDocument !== s.doc) {
+          s.doc = v.ownerDocument;
+          if (page.world.o.resetOnAdopt && !s.dead) {
+            ev('emptied');
+            settle();
+            s.t = 0;
+            if (fed) {
+              s.paused = true;
+              s.dead = true;
+              ev('error');
+            }
+          }
+        }
+        // The feed's IntersectionObserver: a video no longer on the page is
+        // off-screen, and the feed pauses it (once per departure).
+        const onPage = v.ownerDocument === page.doc && page.doc.contains(v);
+        if (onPage) s.ioPaused = false;
+        else if (!s.ioPaused && !s.paused && page.world.o.feedPausesOffscreen) {
+          s.ioPaused = true;
+          page.ioPauses = (page.ioPauses || 0) + 1;
+          v.pause();
+        }
+      });
+      container.querySelector('.site-play')?.addEventListener('click', () => (s.paused ? v.play().catch(() => {}) : v.pause()));
+    }
     const ccBtn = container.querySelector('.ytp-subtitles-button');
     ccBtn?.addEventListener('click', () => container.toggleSubtitles());
     const toggle = () => (s.paused ? v.play().catch(() => {}) : v.pause());
@@ -808,6 +977,11 @@ class Page {
     return 'other';
   }
 
+  // Move mode: the "Move to TV" button the page shows when started without a click.
+  movePrompt(which = '.go') {
+    return this.doc.getElementById('ytpm-move-prompt')?.shadowRoot?.querySelector(which) ?? null;
+  }
+
   clickOverlay() {
     const b = this.doc.getElementById('ytpm-overlay-host')?.shadowRoot?.querySelector('.backdrop');
     if (b) this.userClick(b);
@@ -816,6 +990,83 @@ class Page {
 
   loadBridge() {
     if (!this.closed) vm.runInContext(SRC.bridge, this.vmContext, { filename: this.name + '-bridge.js' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A popup a page opened with window.open('', name, features): an about:blank
+// window with no content script, whose document the opener can script.
+
+class Popup {
+  constructor(world, opener, name, features) {
+    this.world = world;
+    this.name = name;
+    this.closed = false;
+    this.loadedAt = Date.now();
+    this.listener = null; // no content script
+    this.listeners = [];
+    const f = Object.fromEntries(String(features || '').split(',').map((kv) => kv.split('=').map((x) => x.trim())));
+    const bounds = { left: Number(f.left ?? 100), top: Number(f.top ?? 100), width: Number(f.width ?? 1200), height: Number(f.height ?? 800) };
+    if (!world.tvConnected && bounds.left >= SCREENS.tv.x) Object.assign(bounds, { left: 140, top: 140 });
+    this.win = world.newWindow(bounds, 'popup');
+    this.win.byPage = true;
+    this.tab = world.newTab(this.win, 'about:blank');
+    this.tab.page = this;
+    this.tab.popup = this;
+    this.tab.openerTabId = opener.tab.id;
+    world.focused = this.win.id;
+    this.doc = opener.doc.implementation.createHTMLDocument('');
+    world.popups.add(this);
+    this.proxy = this.makeProxy(opener);
+  }
+
+  makeProxy(opener) {
+    const p = this;
+    const w = this.world;
+    const win = () => w.windows.get(p.win.id) || p.win;
+    const scr = () => w.screenAt(win());
+    const full = () => win().state === 'fullscreen';
+    const screen = {};
+    const def = (obj, k, get) => Object.defineProperty(obj, k, { configurable: true, enumerable: true, get });
+    def(screen, 'width', () => scr().w);
+    def(screen, 'height', () => scr().h);
+    def(screen, 'availLeft', () => scr().x);
+    def(screen, 'availTop', () => scr().y + scr().menu);
+    def(screen, 'availWidth', () => scr().w);
+    def(screen, 'availHeight', () => scr().h - scr().menu);
+    const proxy = {
+      document: p.doc, screen, name: p.name, opener: opener.win, devicePixelRatio: 2,
+      close: () => { if (!p.closed) w.removeWindow(p.win.id).catch(() => {}); },
+      focus: () => {},
+      addEventListener: (type, fn) => p.listeners.push({ type, fn }),
+      removeEventListener: (type, fn) => { p.listeners = p.listeners.filter((l) => l.type !== type || l.fn !== fn); },
+    };
+    def(proxy, 'closed', () => p.closed);
+    def(proxy, 'screenX', () => (full() ? scr().x : win().left));
+    def(proxy, 'screenY', () => (full() ? scr().y : win().top));
+    def(proxy, 'innerWidth', () => (full() ? scr().w : win().width));
+    def(proxy, 'innerHeight', () => (full() ? scr().h : win().height - 28));
+    def(proxy, 'outerWidth', () => proxy.innerWidth);
+    def(proxy, 'outerHeight', () => proxy.innerHeight + (full() ? 0 : 28));
+    return proxy;
+  }
+
+  fire(type) {
+    for (const l of this.listeners.filter((x) => x.type === type)) {
+      try { l.fn({ type }); } catch (e) { this.world.errors.push(`popup ${type} listener: ${e.stack}`); }
+    }
+  }
+
+  // Closing destroys the document; a video still in it stops for good.
+  close() {
+    if (this.closed) return;
+    this.fire('pagehide');
+    this.closed = true;
+    for (const v of this.doc.querySelectorAll('video')) v.__kill?.();
+  }
+
+  videos() {
+    return [...this.doc.querySelectorAll('video')];
   }
 }
 

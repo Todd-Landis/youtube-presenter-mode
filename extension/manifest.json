@@ -33,6 +33,7 @@
         "content/sites/twitch.js",
         "content/sites/generic.js",
         "content/player.js",
+        "content/move.js",
         "content/controller.js",
         "content/boot.js"
       ],
