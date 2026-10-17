@@ -42,6 +42,7 @@ function render(r) {
     ['Settings', settings],
     ['Remembered TV window spot', tvBounds],
     ['Player state (latest)', L ? `${L.paused ? 'paused' : 'playing'} at ${L.t?.toFixed(1)}s of ${L.d?.toFixed(0)}s, rate ${L.rate}, ${L.vis}${L.focus ? ', focused' : ''}${L.fs ? ', element fullscreen' : ''}` : null],
+    ['Wake lock (keeps the Mac awake)', L ? (L.wakeLock ?? 'not reported') : null],
     ['User agent', D.env?.userAgent],
   ]));
 

@@ -163,8 +163,25 @@ function setup(url, hello, onSend) {
     (m) => (m.type === 'state' ? { ok: true, cmds: queued.splice(0) } : null));
   const { w, vs, api, sent, deliver } = t;
   const doc = w.document;
+  // Fake Screen Wake Lock (installed before the player starts).
+  const wl = { requests: 0, releases: 0, lock: null };
+  Object.defineProperty(w.navigator, 'wakeLock', { configurable: true, value: { request: async (type) => {
+    assert.equal(type, 'screen');
+    wl.requests++;
+    const lock = new w.EventTarget();
+    lock.released = false;
+    lock.release = async () => {
+      if (lock.released) return;
+      lock.released = true;
+      wl.releases++;
+      lock.dispatchEvent(new w.Event('release'));
+    };
+    wl.lock = lock;
+    return lock;
+  } } });
   await sleep(1600);
   assert.ok(doc.documentElement.classList.contains('ytpm-player'), 'player CSS applied');
+  assert.equal(wl.requests, 1, 'wake lock requested once on start');
   assert.ok(!doc.getElementById('ytpm-btn'), 'no presenter button in the player');
   assert.equal(vs.currentTime, 30, 'seeked to start time');
   assert.equal(vs.paused, false, 'playing');
@@ -175,6 +192,13 @@ function setup(url, hello, onSend) {
   assert.equal(last.bridge.mainWorld, true);
   assert.equal(last.bridge.via, 'manifest');
   assert.equal(last.overlay, null);
+  assert.equal(last.wakeLock, 'held', 'wake lock reported as held');
+  // The system drops the lock (e.g. the page was hidden); it comes back when visible.
+  await wl.lock.release();
+  doc.dispatchEvent(new w.Event('visibilitychange'));
+  await sleep(50);
+  assert.equal(wl.requests, 2, 'wake lock re-acquired after the system released it');
+  assert.ok(sent.some((m) => m.type === 'event' && m.name === 'wake-lock-released'));
 
   const cmd = async (action, value) => (await deliver({ type: 'cmd', action, value })).result;
   assert.equal(await cmd('toggleCaptions'), 'api');
@@ -236,8 +260,11 @@ function setup(url, hello, onSend) {
   assert.equal(st.key, 'abc');
   const self = await deliver({ type: 'selftest' });
   assert.ok(self.results.length >= 5, 'self-test produced results');
+  const releasesBefore = wl.releases;
   await deliver({ type: 'orphaned' });
   assert.ok(!doc.documentElement.classList.contains('ytpm-player'), 'orphan restores normal page');
+  assert.equal(wl.releases, releasesBefore + 1, 'wake lock released when presenting ends');
+  assert.equal(wl.lock.released, true);
   assert.deepEqual(t.errors, []);
   console.log('player ok');
 }

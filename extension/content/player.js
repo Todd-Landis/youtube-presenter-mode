@@ -30,6 +30,10 @@ YTPM.Player = (() => {
   let pauseCheck = 0;
   let onCtrlScreenSince = 0;
   const PLACEMENT_HOLD_MS = 1500;
+  let wakeLock = null;
+  let wakeLockState = 'off';
+  let wakeLockPending = false;
+  const WAKE_LOCK_RETRY_MS = 10000;
 
   // Shared CSS for the TV window. Sites that fill with the top layer
   // (popover) mark the element to blow up with data-ytpm-fill and the
@@ -166,7 +170,12 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     timers.push(setInterval(dismissPrompts, 5000));
     document.addEventListener('yt-navigate-finish', () => { bindVideo(); report('nav'); });
     document.addEventListener('fullscreenchange', () => { updateOverlay(); report('fullscreen'); });
-    document.addEventListener('visibilitychange', () => report('visibility'));
+    document.addEventListener('visibilitychange', () => {
+      holdWakeLock('visible');
+      report('visibility');
+    });
+    holdWakeLock('start');
+    timers.push(setInterval(() => holdWakeLock('retry'), WAKE_LOCK_RETRY_MS));
     // Fullscreen changes resize the window; report at once so the background
     // knows promptly whether the player fills its screen.
     window.addEventListener('resize', () => { updateOverlay(); report('resize'); });
@@ -188,10 +197,55 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
     active = false;
     timers.forEach(clearInterval);
     timers = [];
+    dropWakeLock();
     overlay?.remove();
     overlay = null;
     unprepare();
     if (bridge.ready) bridge.call('setRole', null).catch(() => {});
+  }
+
+  // ---- wake lock -------------------------------------------------------------------
+  // Keep the Mac's display awake while presenting. If the display sleeps, the
+  // AirPlay "separate display" session ends abruptly and the Apple TV idles.
+  // The lock is dropped when the page is hidden, so retry when it's visible
+  // again and on a slow timer. It goes away by itself when this window closes.
+
+  function setWakeLockState(next, data) {
+    if (next === wakeLockState) return;
+    wakeLockState = next;
+    event('wake-lock-' + next.split(':')[0], data ?? null);
+  }
+
+  async function holdWakeLock(why) {
+    if (!active || wakeLock || wakeLockPending) return;
+    if (!navigator.wakeLock?.request) return setWakeLockState('unsupported');
+    if (document.visibilityState !== 'visible') return;
+    wakeLockPending = true;
+    try {
+      const lock = await navigator.wakeLock.request('screen');
+      if (!active) {
+        lock.release().catch(() => {});
+        return;
+      }
+      wakeLock = lock;
+      lock.addEventListener('release', () => {
+        if (wakeLock !== lock) return;
+        wakeLock = null;
+        setWakeLockState('released', { visibility: document.visibilityState });
+      });
+      setWakeLockState('held', { why });
+    } catch (e) {
+      setWakeLockState('failed: ' + (e?.name || 'error'), { why, name: e?.name, message: e?.message });
+    } finally {
+      wakeLockPending = false;
+    }
+  }
+
+  function dropWakeLock() {
+    const lock = wakeLock;
+    wakeLock = null;
+    wakeLockState = 'off';
+    lock?.release().catch(() => {});
   }
 
   // ---- video binding -----------------------------------------------------------
@@ -329,6 +383,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
       vis: document.visibilityState,
       focus: document.hasFocus(),
       fs: !!document.fullscreenElement,
+      wakeLock: wakeLockState,
       frames: q ? { dropped: q.droppedVideoFrames, total: q.totalVideoFrames } : null,
       overlay: overlayKind,
       bridge: bridge.info,
@@ -625,6 +680,7 @@ p { margin: 0; color: #c7c7cc; font-size: 19px; }
 
   async function onOverlayClick() {
     const kind = overlayKind;
+    holdWakeLock('click');
     if (kind === 'airplay') pickAirPlay();
     if (kind === 'fullscreen') {
       try {
